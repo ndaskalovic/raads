@@ -1,6 +1,6 @@
 # raads
 
-Compile-time adjoint algorithmic differentiation in Rust. You write a branch-free function once, generic over `AdNum`; a macro turns it into straight-line SIMD code for the value, the gradient in one reverse pass, and Hessian-vector products (forward-over-reverse).
+Compile-time adjoint algorithmic differentiation in Rust. You write a branch-free function once, generic over `AdNum`; a macro turns it into SIMD code, straight-line apart from the function's own loops, for the value, the gradient in one reverse pass, and Hessian-vector products (forward-over-reverse).
 
 - `raads`: the core (`#[kernel]`, `AdNum`, `Real`, `Dual`, SIMD `Lanes`).
 - `raads-engines`: Monte Carlo path (`paths`) and 1-D PDE (`pde1d`) engines that run a few kernels in their loops and return gradients w.r.t. every model parameter.
@@ -69,7 +69,7 @@ For option prices and Greeks, see `raads-finance` (`crates/raads-finance`, with 
 
 ![Benchmark chart](benchmarks/ad-benchmarks/chart.png)
 
-Heston MC and SABR calibration from [XAD's benchmark suite](https://github.com/auto-differentiation/ad-benchmarks), with raads added: gradient time, f64, Apple M5, single core. Details, more benchmarks (Enzyme, second order) and how to reproduce: [`benchmarks/`](benchmarks).
+Heston MC, SABR calibration and LIBOR swaption from [XAD's benchmark suite](https://github.com/auto-differentiation/ad-benchmarks), with raads added: gradient time, f64, Apple M5, single core. Details, more benchmarks (Enzyme, second order) and how to reproduce: [`benchmarks/`](benchmarks).
 
 raads needs nightly Rust (`std::simd`); `rust-toolchain.toml` pins the version. On x86_64, build with `RUSTFLAGS="-C target-cpu=x86-64-v3"` (AVX2 + FMA) or `native`; default builds get SSE2 without FMA, which is much slower.
 

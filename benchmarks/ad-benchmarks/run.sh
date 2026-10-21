@@ -1,7 +1,8 @@
 #!/bin/sh
-# Heston MC and SABR calibration from auto-differentiation/ad-benchmarks (the suite in XAD's
-# README), with raads added: builds and runs the suite, generates its inputs and XAD's results
-# for raads (reference.cpp), runs raads (src/bin/adbench.rs) and draws chart.png (plot.py).
+# Heston MC, SABR calibration and LIBOR swaption from auto-differentiation/ad-benchmarks (the
+# suite in XAD's README), with raads added: builds and runs the suite, generates its inputs and
+# XAD's results for raads (reference.cpp), runs raads (src/bin/adbench.rs) and draws chart.png
+# (plot.py).
 # Needs git, cmake (or CMAKE="uvx cmake"), a C++17 compiler, uv and the pinned nightly.
 set -e
 cd "$(dirname "$0")/../.."
@@ -17,7 +18,7 @@ perl -0pi -e "s/-mavx2 -mfma/$CPU/; s|(CppAD.git\s+GIT_TAG\s+)master|\${1}main|"
 # CppAD's build needs pkg-config: left out
 $CMAKE -S $SUITE -B $SUITE/build -DCMAKE_BUILD_TYPE=Release -DENABLE_CPPAD=OFF
 $CMAKE --build $SUITE/build -j 4
-(cd $SUITE && ./build/ad_benchmarks --only heston,sabr)
+(cd $SUITE && ./build/ad_benchmarks --only heston,sabr,libor)
 
 # inputs and XAD results for raads, with the suite's own headers and XAD build
 $CXX -std=c++17 -O3 $CPU -DNDEBUG -I $SUITE -I $SUITE/build/_deps/xad-src/src -I $SUITE/build/_deps/xad-build/src \

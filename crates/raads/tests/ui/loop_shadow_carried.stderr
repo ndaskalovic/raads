@@ -1,0 +1,13 @@
+error: `s` is carried to the next iteration: a `let` here would hide it, use another name
+ --> tests/ui/loop_shadow_carried.rs:8:13
+  |
+8 |         let s = s + 1.0;
+  |             ^
+
+warning: unused import: `AdNum`
+ --> tests/ui/loop_shadow_carried.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

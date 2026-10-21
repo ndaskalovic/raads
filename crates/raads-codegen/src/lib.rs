@@ -1,17 +1,22 @@
 //! Kernel graphs and the code generator behind `raads`.
 //!
 //! A kernel is a branch-free function traced (or parsed) into a [`Graph`]: inputs, data,
-//! constants and operations in evaluation order, plus the output nodes. The passes in
+//! constants and operations in evaluation order, plus the output nodes. Loops stay loops:
+//! their nodes sit between a [`Op::Loop`] marker and its [`Op::End`]. The passes in
 //! [`passes`] decide which nodes need adjoints and which forward values the reverse sweep
-//! reads; [`emit`] turns the graph into straight-line Rust generic over `R: raads::Real`.
+//! reads; [`emit`] turns the graph into Rust generic over `R: raads::Real`.
 //! Internal to `raads` and its macros: no stability guarantees.
 
 #![warn(missing_docs)]
 
 pub mod emit;
+mod int;
 pub mod passes;
+mod unroll;
 
 pub use emit::{Group, Signature};
+pub use int::Int;
+pub use unroll::unroll;
 
 /// Operand slot that is not used.
 pub const NONE: usize = usize::MAX;
@@ -50,6 +55,36 @@ pub enum Op {
     SelGt,
     /// value of `a`, zero derivative
     Stop,
+    /// `for var in lo..hi {`: the loop's nodes follow, up to the matching [`Op::End`].
+    Loop(String, Int, Int),
+    /// End of the innermost open loop.
+    End,
+    /// A value carried by the enclosing loop: `a` before the first iteration, the `b` of its
+    /// [`Op::Next`] after each one. Sits at the start of the loop body.
+    Phi,
+    /// End of an iteration: the [`Op::Phi`] `a` takes the value `b`.
+    Next,
+    /// Value of the [`Op::Phi`] `a` after its loop. Sits right after the loop's [`Op::End`].
+    Out,
+    /// Local array `[a; len]`.
+    Array(usize),
+    /// Element `idx` of the local [`Op::Array`] `a`.
+    Load(Int),
+    /// Element `idx` of the local [`Op::Array`] `a` is set to `b`.
+    Store(Int),
+    /// The integer `idx` as an `f64` (a loop index as a number).
+    Int(Int),
+    /// Element `idx` of an array parameter.
+    Param {
+        /// Input (or data) number of element 0.
+        first: usize,
+        /// Array length.
+        len: usize,
+        /// A data parameter.
+        data: bool,
+        /// Element index.
+        idx: Int,
+    },
 }
 
 /// An operation and its operand node indices ([`NONE`] when unused).
@@ -97,6 +132,40 @@ impl Graph {
         debug_assert!([a, b, c, d].iter().all(|&i| i == NONE || i < self.nodes.len()));
         self.nodes.push(Node::new(op, a, b, c, d));
         self.nodes.len() - 1
+    }
+    /// Innermost [`Op::Loop`] around each node ([`NONE`] at the top level). An
+    /// [`Op::Loop`] belongs to the loop around it, an [`Op::End`] to the loop it closes.
+    pub fn parents(&self) -> Vec<usize> {
+        let mut open = Vec::new();
+        let mut parent = vec![NONE; self.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            parent[i] = open.last().copied().unwrap_or(NONE);
+            match n.op {
+                Op::Loop(..) => open.push(i),
+                Op::End => {
+                    open.pop();
+                }
+                _ => {}
+            }
+        }
+        parent
+    }
+    /// The matching [`Op::End`] of each [`Op::Loop`] ([`NONE`] for other nodes).
+    pub fn ends(&self) -> Vec<usize> {
+        let mut open = Vec::new();
+        let mut end = vec![NONE; self.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            match n.op {
+                Op::Loop(..) => open.push(i),
+                Op::End => end[open.pop().expect("unbalanced loop")] = i,
+                _ => {}
+            }
+        }
+        end
+    }
+    /// The graph has loops.
+    pub fn has_loops(&self) -> bool {
+        self.nodes.iter().any(|n| matches!(n.op, Op::Loop(..)))
     }
     /// Number of nodes.
     pub fn len(&self) -> usize {

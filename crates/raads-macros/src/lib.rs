@@ -1,5 +1,5 @@
 //! Attribute macros for `raads`: `#[kernel]` turns a function written against `N: AdNum`
-//! into straight-line forward and reverse code; `#[kernels(engine)]` compiles the kernels of
+//! into forward and reverse code (straight-line apart from its own loops); `#[kernels(engine)]` compiles the kernels of
 //! an `impl` block for an engine. Re-exported by `raads`; see its docs.
 //!
 //! Generated code names `raads` by the path the calling crate gives it, so a renamed
@@ -65,14 +65,23 @@ pub fn check_kernels(input: TokenStream) -> TokenStream {
 /// Keeps the function (callable on any `AdNum`: `f64`, SIMD packs, `Dual`, the tracer) and
 /// adds a module of the same name with `eval`, `vjp`, `fwd`, `bwd`, `NRES` and `graph`.
 /// Parameters are `N` or `[N; LITERAL]`; `#[data]` marks non-differentiable ones.
-/// The body is `let` bindings, assignments and a final value using `+ - * /`, `exp ln sqrt
-/// powf relu detach maximum minimum smooth_relu`, `N::select_gt(a, b, x, y)`, `N::from(k)`,
-/// integer literal indices and `f64` constants: literals, paths (`Self::EPS`,
-/// `std::f64::consts::PI`) and SCREAMING_CASE names; any other bare name must be a parameter
-/// or a local. Integer literals are `f64`s (`x * 2`), and plain `f64`s are accepted where
-/// an `N` is expected (`x.maximum(0.0)`). Parameter names `y`, `res`, `a_*`, and `v`, `a` or
-/// `q` followed by digits are reserved by the generated code, as is the generic parameter name
-/// `R` on a `#[kernels]` `impl`.
+/// The body is `let` bindings, assignments, `for` loops and a final value using `+ - * /`,
+/// `exp ln sqrt powf relu detach maximum minimum smooth_relu`, `N::select_gt(a, b, x, y)`,
+/// `N::from(k)` and `f64` constants: literals, paths (`Self::EPS`, `std::f64::consts::PI`)
+/// and SCREAMING_CASE names; any other bare name must be a parameter or a local. Integer
+/// literals are `f64`s (`x * 2`), and plain `f64`s are accepted where an `N` is expected
+/// (`x.maximum(0.0)`).
+///
+/// Loops run over `lo..hi`. Bounds and array indices are integer literals, loop variables and
+/// `+ - * / %` of them; `i as f64` is a loop variable's value. Outer variables a loop body
+/// assigns carry over to the next iteration (they must be `N`s, and a `let` in the body may
+/// not reuse their name), and local arrays `let mut a = [x; LEN];` can be assigned by element
+/// (`a[i] = ..;`) but not copied. Loops stay loops in the generated code: each forward
+/// iteration saves what its reverse needs, so code size does not grow with the trip count.
+///
+/// Parameter and loop variable names `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`,
+/// `m`, `ac` or `am` followed by digits are reserved by the generated code, as is the generic
+/// parameter name `R` on a `#[kernels]` `impl`.
 ///
 /// The generated code refers to `raads` by the name the calling crate's `Cargo.toml` gives
 /// it, so a renamed dependency (`aad = { package = "raads", .. }`) works.
@@ -169,12 +178,7 @@ pub(crate) fn compile(mut f: ItemFn, vis: &str, names: [&str; 4], krate: &Tokens
         let Pat::Ident(id) = &*pt.pat else { return Err(Error::new(pt.pat.span(), "parameters must be plain names")) };
         let name = id.ident.to_string();
         if is_reserved(&name) {
-            return Err(Error::new(
-                id.span(),
-                format!(
-                    "parameter name `{name}` is reserved by the generated code (reserved: `y`, `res`, `a_*`, `v`, `a` or `q` followed by digits)"
-                ),
-            ));
+            return Err(Error::new(id.span(), format!("parameter name `{name}` is reserved by the generated code ({RESERVED})")));
         }
         params.push(Param { name, shape: shape(&pt.ty, &n)?, data });
     }
@@ -185,6 +189,7 @@ pub(crate) fn compile(mut f: ItemFn, vis: &str, names: [&str; 4], krate: &Tokens
     let mut b = Builder::new(&params, &n, krate);
     let (val, body) = b.block(&f.block)?;
     b.outputs(&val, ret, f.block.span())?;
+    raads_codegen::passes::runs(&b.g).map_err(|e| Error::new(f.block.span(), e))?;
     let sig = Signature {
         groups: params
             .iter()
@@ -217,9 +222,14 @@ pub(crate) fn compile(mut f: ItemFn, vis: &str, names: [&str; 4], krate: &Tokens
     Ok(Compiled { source: f, eval, vjp, fwd, bwd, nres, graph })
 }
 
-/// Names the generated code uses next to the parameters: `res` (residuals), `a_y` and
-/// `a_<param>` (adjoints), `v<i>` and `a<i>` (node values and adjoints), `q<i>` (quotients).
-fn is_reserved(s: &str) -> bool {
-    let temp = s.len() > 1 && s.starts_with(['v', 'a', 'q']) && s[1..].bytes().all(|c| c.is_ascii_digit());
-    s == "y" || s == "res" || s.starts_with("a_") || temp
+/// The names [`is_reserved`] rejects, for error messages.
+pub(crate) const RESERVED: &str = "reserved: `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`, `m`, `ac` or `am` followed by digits";
+
+/// Names the generated code uses next to the parameters and loop variables: `res`
+/// (residuals), `tape` and `tp` (loop tape), `a_y` and `a_<param>` (adjoints), `v<i>` and
+/// `a<i>` (node values and adjoints), `q<i>` (quotients), `c<i>` and `ac<i>` (carried values
+/// and their adjoints), `m<i>` and `am<i>` (local arrays and their adjoints).
+pub(crate) fn is_reserved(s: &str) -> bool {
+    let temp = |p: &str| s.len() > p.len() && s.starts_with(p) && s[p.len()..].bytes().all(|c| c.is_ascii_digit());
+    ["y", "res", "tape", "tp"].contains(&s) || s.starts_with("a_") || ["v", "a", "q", "c", "m", "ac", "am"].into_iter().any(temp)
 }

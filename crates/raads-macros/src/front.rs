@@ -6,14 +6,20 @@
 //! `Self::EPS`) are not nodes; literals fold at expansion time, other expressions stay
 //! symbolic and are evaluated by the compiler in the generated code.
 //!
+//! Loops are not unrolled: a `for` loop becomes a [`Op::Loop`] marker, its body (traced
+//! once, with the loop variable symbolic), an [`Op::End`], and a carried value
+//! ([`Op::Phi`], [`Op::Next`], [`Op::Out`]) for every outer variable the body assigns.
+//! Arrays written with a loop-dependent index are local arrays (`let mut a = [x; LEN]`) or
+//! array parameters, read and written through [`Op::Load`], [`Op::Store`], [`Op::Param`].
+//!
 //! It also returns the function body rewritten so it compiles for any `N: AdNum`
 //! (`2 * x` becomes `x.rmul(2f64)`, `x.maximum(0.0)` becomes `x.maximum(N::from(0.0))`),
 //! which is the eager / tracer version of the kernel.
 
 use proc_macro2::{Ident, Literal, Span, TokenStream};
 use quote::{ToTokens, quote, quote_spanned};
-use raads_codegen::{Graph, NONE, Op, f64_literal};
-use std::collections::HashMap;
+use raads_codegen::{Graph, Int, NONE, Op, f64_literal};
+use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::{BinOp, Error, Expr, Lit, Pat, Result, Stmt, UnOp};
 
@@ -47,6 +53,8 @@ pub enum Val {
     Node(usize),
     F(F),
     Arr(Vec<Val>),
+    /// A local array (the node of its [`Op::Array`]).
+    Mem(usize),
 }
 
 /// Shape of a parameter or result: `N` or `[N; len]`.
@@ -67,6 +75,17 @@ pub struct Builder {
     /// Rust source of each constant node's value (as an `f64` expression).
     pub consts: Vec<Option<F>>,
     env: HashMap<String, Val>,
+    /// Array parameters still bound to their name: (input or data number of element 0,
+    /// length, data).
+    params: HashMap<String, (usize, usize, bool)>,
+    /// Loop variables in scope, innermost last.
+    ints: Vec<String>,
+    /// Current value of local array elements read or written since the last loop boundary:
+    /// (array, index source) → node. Reading an element twice gives the same node, as it
+    /// does in the eager function.
+    elems: HashMap<(usize, String), usize>,
+    /// Variables the innermost loop carries to its next iteration.
+    carried: Vec<String>,
     /// The kernel's number type parameter and the path of `raads`.
     n: Ident,
     krate: TokenStream,
@@ -79,10 +98,23 @@ fn err<T>(span: Span, msg: &str) -> Result<T> {
 impl Builder {
     /// Records input nodes (non-data params in order), then data nodes.
     pub fn new(params: &[Param], n: &Ident, krate: &TokenStream) -> Self {
-        let mut b = Builder { g: Graph::default(), consts: Vec::new(), env: HashMap::new(), n: n.clone(), krate: krate.clone() };
+        let mut b = Builder {
+            g: Graph::default(),
+            consts: Vec::new(),
+            env: HashMap::new(),
+            params: HashMap::new(),
+            ints: Vec::new(),
+            elems: HashMap::new(),
+            carried: Vec::new(),
+            n: n.clone(),
+            krate: krate.clone(),
+        };
         for data in [false, true] {
             let mut k = 0;
             for p in params.iter().filter(|p| p.data == data) {
+                if let Shape::Array(len) = p.shape {
+                    b.params.insert(p.name.clone(), (k, len, data));
+                }
                 let mut leaf = || {
                     let op = if data { Op::Data(k) } else { Op::Input(k) };
                     k += 1;
@@ -113,8 +145,18 @@ impl Builder {
         match v {
             Val::Node(i) => Ok(*i),
             Val::F(f) => Ok(self.konst(f)),
-            Val::Arr(_) => err(span, "expected a number, found an array"),
+            Val::Arr(_) | Val::Mem(_) => err(span, "expected a number, found an array"),
         }
+    }
+
+    /// Bind `name` (a `let` or an assignment); it no longer names an array parameter.
+    fn set(&mut self, name: String, v: Val, span: Span) -> Result<()> {
+        if self.ints.contains(&name) {
+            return err(span, &format!("`{name}` shadows a loop variable"));
+        }
+        self.params.remove(&name);
+        self.env.insert(name, v);
+        Ok(())
     }
 
     /// Rewritten source `t` of `v` where an `N` is expected: plain `f64`s become `N::from(t)`
@@ -137,9 +179,20 @@ impl Builder {
 
     /// Statements then the tail expression; returns its value and the rewritten body.
     pub fn block(&mut self, block: &syn::Block) -> Result<(Val, TokenStream)> {
+        let Some((Stmt::Expr(tail, None), stmts)) = block.stmts.split_last().filter(|(t, _)| !matches!(t, Stmt::Expr(Expr::ForLoop(_), _)))
+        else {
+            return err(block.span(), "a kernel must end with its result value");
+        };
+        let mut out = self.stmts(stmts)?;
+        let (v, t) = self.expr(tail)?;
+        out.extend(t);
+        Ok((v, out))
+    }
+
+    /// Statements without a result; the rewritten source.
+    fn stmts(&mut self, stmts: &[Stmt]) -> Result<TokenStream> {
         let mut out = TokenStream::new();
-        let n = block.stmts.len();
-        for (i, st) in block.stmts.iter().enumerate() {
+        for st in stmts {
             match st {
                 Stmt::Local(l) => {
                     let init = l.init.as_ref().ok_or_else(|| Error::new(l.span(), "`let` needs a value"))?;
@@ -147,37 +200,145 @@ impl Builder {
                         return err(l.span(), "`let ... else` is not supported in a kernel");
                     }
                     let (v, e) = self.expr(&init.expr)?;
+                    if has_mem(&v) && !matches!(&*init.expr, Expr::Repeat(_)) {
+                        return err(init.expr.span(), "copying a local array is not supported: index it instead");
+                    }
                     self.bind(&l.pat, v)?;
                     let pat = &l.pat;
                     out.extend(quote_spanned!(l.span()=> let #pat = #e;));
                 }
-                Stmt::Expr(e, semi) if i + 1 == n && semi.is_none() => {
-                    let (v, t) = self.expr(e)?;
-                    out.extend(t);
-                    return Ok((v, out));
+                Stmt::Expr(Expr::Assign(a), _) if matches!(&*a.left, Expr::Index(_)) => {
+                    let Expr::Index(ix) = &*a.left else { unreachable!() };
+                    let name = ident_of(&ix.expr)?;
+                    let Some(&Val::Mem(m)) = self.env.get(&name) else {
+                        return err(ix.expr.span(), "only local arrays (`let mut a = [x; LEN];`) can be assigned by element");
+                    };
+                    let idx = self.int(&ix.index)?;
+                    let (v, e) = self.expr(&a.right)?;
+                    self.check_index(&idx, m, ix.index.span())?;
+                    let val = self.node(&v, a.right.span())?;
+                    // any element of `m` may be the one written
+                    self.elems.retain(|&(a, _), _| a != m);
+                    self.elems.insert((m, idx.to_string()), val);
+                    self.push(Op::Store(idx), m, val, NONE, NONE);
+                    let (l, e) = (&a.left, self.as_n(&v, e));
+                    out.extend(quote!(#l = #e;));
                 }
-                Stmt::Expr(Expr::Assign(a), Some(_)) => {
+                Stmt::Expr(Expr::Assign(a), _) => {
                     let name = ident_of(&a.left)?;
-                    if !self.env.contains_key(&name) {
-                        return err(a.left.span(), &format!("unknown variable `{name}`"));
+                    match self.env.get(&name) {
+                        None => return err(a.left.span(), &format!("unknown variable `{name}`")),
+                        Some(Val::Mem(_)) => return err(a.left.span(), "a local array is assigned by element: `a[i] = x;`"),
+                        _ => {}
                     }
                     let (v, e) = self.expr(&a.right)?;
-                    self.env.insert(name, v);
+                    if has_mem(&v) {
+                        return err(a.right.span(), "copying a local array is not supported: index it instead");
+                    }
+                    self.set(name, v, a.left.span())?;
                     let l = &a.left;
                     out.extend(quote!(#l = #e;));
                 }
-                _ => return err(st.span(), "kernel statements are `let` bindings, assignments and a final value"),
+                Stmt::Expr(Expr::ForLoop(f), _) => out.extend(self.for_loop(f)?),
+                _ => return err(st.span(), "kernel statements are `let` bindings, assignments, `for` loops and a final value"),
             }
         }
-        err(block.span(), "a kernel must end with its result value")
+        Ok(out)
+    }
+
+    /// `for i in lo..hi { .. }`: the body is traced once. Outer variables it assigns are
+    /// carried from one iteration to the next.
+    fn for_loop(&mut self, f: &syn::ExprForLoop) -> Result<TokenStream> {
+        let Pat::Ident(pi) = &*f.pat else { return err(f.pat.span(), "a loop variable is a plain name") };
+        let var = pi.ident.to_string();
+        if crate::is_reserved(&var) {
+            return err(pi.span(), &format!("loop variable name `{var}` is reserved by the generated code ({})", crate::RESERVED));
+        }
+        let Expr::Range(r) = &*f.expr else { return err(f.expr.span(), "a kernel loop runs over a range `lo..hi`") };
+        let (Some(start), Some(end), syn::RangeLimits::HalfOpen(_)) = (&r.start, &r.end, &r.limits) else {
+            return err(r.span(), "a kernel loop runs over a range `lo..hi`");
+        };
+        let (lo, hi) = (self.int(start)?, self.int(end)?);
+        let mut carried = Vec::new();
+        assigned(&f.body.stmts, &mut HashSet::new(), &mut carried);
+        carried.retain(|name| self.env.contains_key(name));
+        // initial values, before the loop
+        let mut inits = Vec::new();
+        for name in &carried {
+            match &self.env[name] {
+                Val::Node(v) => inits.push(*v),
+                Val::F(_) => return err(f.span(), &format!("`{name}` is a plain f64 changed in a loop: start it as `N::from(..)`")),
+                _ => return err(f.span(), &format!("`{name}` is an array: assign a local array by element in a loop")),
+            }
+        }
+        let (env, params) = (self.env.clone(), self.params.clone());
+        self.elems.clear();
+        self.push(Op::Loop(var.clone(), lo, hi), NONE, NONE, NONE, NONE);
+        let phis: Vec<usize> = inits.iter().map(|&init| self.push(Op::Phi, init, NONE, NONE, NONE)).collect();
+        for (name, &p) in carried.iter().zip(&phis) {
+            self.env.insert(name.clone(), Val::Node(p));
+        }
+        self.ints.push(var);
+        let outer = std::mem::replace(&mut self.carried, carried.clone());
+        let body = self.stmts(&f.body.stmts);
+        self.carried = outer;
+        self.ints.pop();
+        let body = body?;
+        for (name, &p) in carried.iter().zip(&phis) {
+            let v = self.env[name].clone();
+            let next = self.node(&v, f.span())?;
+            self.push(Op::Next, p, next, NONE, NONE);
+        }
+        self.elems.clear();
+        self.push(Op::End, NONE, NONE, NONE, NONE);
+        (self.env, self.params) = (env, params);
+        for (name, &p) in carried.iter().zip(&phis) {
+            let out = self.push(Op::Out, p, NONE, NONE, NONE);
+            self.env.insert(name.clone(), Val::Node(out));
+        }
+        let (pat, range, attrs) = (&f.pat, &f.expr, &f.attrs);
+        Ok(quote!(#(#attrs)* for #pat in #range { #body }))
+    }
+
+    /// An integer expression: literals, loop variables and `+ - * / %`.
+    fn int(&self, e: &Expr) -> Result<Int> {
+        match e {
+            Expr::Lit(syn::ExprLit { lit: Lit::Int(k), .. }) => Ok(Int::Lit(k.base10_parse()?)),
+            Expr::Path(p) if p.path.get_ident().is_some_and(|id| self.ints.contains(&id.to_string())) => {
+                Ok(Int::Var(p.path.get_ident().unwrap().to_string()))
+            }
+            Expr::Paren(p) => self.int(&p.expr),
+            Expr::Group(g) => self.int(&g.expr),
+            Expr::Binary(b) => {
+                let op = match b.op {
+                    BinOp::Add(_) => '+',
+                    BinOp::Sub(_) => '-',
+                    BinOp::Mul(_) => '*',
+                    BinOp::Div(_) => '/',
+                    BinOp::Rem(_) => '%',
+                    _ => return err(b.op.span(), "integer expressions in a kernel use `+ - * / %`"),
+                };
+                Ok(Int::Bin(Box::new(self.int(&b.left)?), op, Box::new(self.int(&b.right)?)))
+            }
+            _ => err(e.span(), "loop bounds and indices in a kernel are integer literals, loop variables and `+ - * / %` of them"),
+        }
+    }
+
+    /// A constant index is within the local array `m`.
+    fn check_index(&self, idx: &Int, m: usize, span: Span) -> Result<()> {
+        let Op::Array(len) = self.g.nodes[m].op else { unreachable!() };
+        match idx.constant() {
+            Some(k) if k >= len => err(span, "index out of bounds"),
+            _ => Ok(()),
+        }
     }
 
     fn bind(&mut self, pat: &Pat, v: Val) -> Result<()> {
         match (pat, v) {
-            (Pat::Ident(p), v) => {
-                self.env.insert(p.ident.to_string(), v);
-                Ok(())
+            (Pat::Ident(p), _) if self.carried.contains(&p.ident.to_string()) => {
+                err(p.span(), &format!("`{}` is carried to the next iteration: a `let` here would hide it, use another name", p.ident))
             }
+            (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span()),
             (Pat::Type(t), v) => self.bind(&t.pat, v),
             (Pat::Wild(_), _) => Ok(()),
             (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => t.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v)),
@@ -213,6 +374,9 @@ impl Builder {
                 // paths (`Self::EPS`, `f64::consts::PI`) are `f64` constants.
                 if let Some(id) = p.path.get_ident() {
                     let name = id.to_string();
+                    if self.ints.contains(&name) {
+                        return err(sp, &format!("`{name}` is a loop variable (`usize`): write `{name} as f64` for its value"));
+                    }
                     if let Some(v) = self.env.get(&name) {
                         return Ok((v.clone(), e.to_token_stream()));
                     }
@@ -223,15 +387,59 @@ impl Builder {
                 Ok((Val::F(F::Expr(e.to_token_stream())), e.to_token_stream()))
             }
             Expr::Index(ix) => {
-                let (v, t) = self.expr(&ix.expr)?;
-                let Expr::Lit(syn::ExprLit { lit: Lit::Int(k), .. }) = &*ix.index else {
-                    return err(ix.index.span(), "array indices in a kernel must be integer literals");
-                };
-                let k: usize = k.base10_parse()?;
-                let Val::Arr(vs) = v else { return err(sp, "indexing a value that is not an array") };
-                let v = vs.get(k).cloned().ok_or_else(|| Error::new(ix.index.span(), "index out of bounds"))?;
+                let idx = self.int(&ix.index)?;
                 let i = &ix.index;
+                let param = match &*ix.expr {
+                    Expr::Path(p) => p.path.get_ident().and_then(|id| self.params.get(&id.to_string())).copied(),
+                    _ => None,
+                };
+                if let (Some((first, len, data)), None) = (param, idx.constant()) {
+                    let a = &ix.expr;
+                    let v = self.push(Op::Param { first, len, data, idx }, NONE, NONE, NONE, NONE);
+                    return Ok((Val::Node(v), quote!(#a[#i])));
+                }
+                let (v, t) = self.expr(&ix.expr)?;
+                let v = match (v, idx.constant()) {
+                    (Val::Arr(vs), Some(k)) => vs.get(k).cloned().ok_or_else(|| Error::new(ix.index.span(), "index out of bounds"))?,
+                    (Val::Arr(_), None) => {
+                        return err(
+                            ix.index.span(),
+                            "an index that depends on a loop variable needs an array parameter or a local array (`let mut a = [x; LEN];`)",
+                        );
+                    }
+                    (Val::Mem(m), _) => {
+                        self.check_index(&idx, m, ix.index.span())?;
+                        let key = (m, idx.to_string());
+                        match self.elems.get(&key) {
+                            Some(&v) => Val::Node(v),
+                            None => {
+                                let v = self.push(Op::Load(idx), m, NONE, NONE, NONE);
+                                self.elems.insert(key, v);
+                                Val::Node(v)
+                            }
+                        }
+                    }
+                    _ => return err(sp, "indexing a value that is not an array"),
+                };
                 Ok((v, quote!(#t[#i])))
+            }
+            Expr::Repeat(r) => {
+                let Some(len) = self.int(&r.len)?.constant() else { return err(r.len.span(), "array lengths are constant") };
+                let (v, t) = self.expr(&r.expr)?;
+                let fill = self.node(&v, r.expr.span())?;
+                let m = self.push(Op::Array(len), fill, NONE, NONE, NONE);
+                let (t, l) = (self.as_n(&v, t), &r.len);
+                Ok((Val::Mem(m), quote!([#t; #l])))
+            }
+            Expr::Cast(c) if matches!(&*c.ty, syn::Type::Path(p) if p.path.is_ident("f64")) => {
+                // a loop index is a (passive) node, so plain f64 arithmetic never sees it
+                let idx = self.int(&c.expr)?;
+                if let Some(k) = idx.constant() {
+                    return Ok((Val::F(F::Num(k as f64)), e.to_token_stream()));
+                }
+                let v = self.push(Op::Int(idx), NONE, NONE, NONE, NONE);
+                let n = &self.n;
+                Ok((Val::Node(v), quote!(<#n as ::core::convert::From<f64>>::from(#e))))
             }
             Expr::Array(a) => {
                 let mut vs = Vec::new();
@@ -482,6 +690,9 @@ impl Builder {
         let outs = match (shape, v) {
             (Shape::Scalar, v) => vec![self.node(v, span)?],
             (Shape::Array(n), Val::Arr(vs)) if vs.len() == n => vs.iter().map(|x| self.node(x, span)).collect::<Result<_>>()?,
+            (Shape::Array(n), &Val::Mem(m)) if self.g.nodes[m].op == Op::Array(n) => {
+                (0..n).map(|k| self.push(Op::Load(Int::Lit(k)), m, NONE, NONE, NONE)).collect()
+            }
             _ => return err(span, "result does not match the declared return type"),
         };
         self.g.outs = outs;
@@ -522,6 +733,31 @@ impl Builder {
                 Op::Relu => quote!(Relu),
                 Op::SelGt => quote!(SelGt),
                 Op::Stop => quote!(Stop),
+                Op::Loop(var, lo, hi) => {
+                    let (lo, hi) = (int_code(lo, krate), int_code(hi, krate));
+                    quote!(Loop(#var.to_string(), #lo, #hi))
+                }
+                Op::End => quote!(End),
+                Op::Phi => quote!(Phi),
+                Op::Next => quote!(Next),
+                Op::Out => quote!(Out),
+                Op::Array(len) => quote!(Array(#len)),
+                Op::Load(idx) => {
+                    let idx = int_code(idx, krate);
+                    quote!(Load(#idx))
+                }
+                Op::Store(idx) => {
+                    let idx = int_code(idx, krate);
+                    quote!(Store(#idx))
+                }
+                Op::Param { first, len, data, idx } => {
+                    let idx = int_code(idx, krate);
+                    quote!(Param { first: #first, len: #len, data: #data, idx: #idx })
+                }
+                Op::Int(idx) => {
+                    let idx = int_code(idx, krate);
+                    quote!(Int(#idx))
+                }
             };
             quote!(g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
         });
@@ -531,6 +767,61 @@ impl Builder {
             #(#nodes)*
             g.outs = vec![#(#outs),*];
             g
+        }
+    }
+}
+
+/// `v` is or contains a local array.
+fn has_mem(v: &Val) -> bool {
+    match v {
+        Val::Mem(_) => true,
+        Val::Arr(vs) => vs.iter().any(has_mem),
+        _ => false,
+    }
+}
+
+/// Code that builds `i`.
+fn int_code(i: &Int, krate: &TokenStream) -> TokenStream {
+    match i {
+        Int::Lit(k) => quote!(#krate::__private::codegen::Int::Lit(#k)),
+        Int::Var(v) => quote!(#krate::__private::codegen::Int::Var(#v.to_string())),
+        Int::Bin(a, op, b) => {
+            let (a, b) = (int_code(a, krate), int_code(b, krate));
+            quote!(#krate::__private::codegen::Int::Bin(Box::new(#a), #op, Box::new(#b)))
+        }
+    }
+}
+
+/// Outer variables the statements assign (not declared by them first), in order.
+fn assigned(stmts: &[Stmt], locals: &mut HashSet<String>, out: &mut Vec<String>) {
+    fn names(p: &Pat, locals: &mut HashSet<String>) {
+        match p {
+            Pat::Ident(i) => {
+                locals.insert(i.ident.to_string());
+            }
+            Pat::Type(t) => names(&t.pat, locals),
+            Pat::Tuple(t) => t.elems.iter().for_each(|p| names(p, locals)),
+            Pat::Slice(s) => s.elems.iter().for_each(|p| names(p, locals)),
+            _ => {}
+        }
+    }
+    for st in stmts {
+        match st {
+            Stmt::Local(l) => names(&l.pat, locals),
+            Stmt::Expr(Expr::Assign(a), _) => {
+                if let Ok(name) = ident_of(&a.left)
+                    && !locals.contains(&name)
+                    && !out.contains(&name)
+                {
+                    out.push(name);
+                }
+            }
+            Stmt::Expr(Expr::ForLoop(f), _) => {
+                let mut inner = locals.clone();
+                names(&f.pat, &mut inner);
+                assigned(&f.body.stmts, &mut inner, out);
+            }
+            _ => {}
         }
     }
 }
