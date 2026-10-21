@@ -1,6 +1,6 @@
 # raads
 
-Compile-time adjoint algorithmic differentiation in Rust. You write a branch-free function once, generic over `AdNum`; a macro turns it into straight-line SIMD code for the value, the gradient in one reverse pass, and Hessian-vector products (forward-over-reverse).
+Compile-time adjoint algorithmic differentiation in Rust. You write a branch-free function once, generic over `AdNum`; a macro turns it into SIMD code, straight-line apart from the function's own loops, for the value, the gradient in one reverse pass, and Hessian-vector products (forward-over-reverse).
 
 - `raads`: the core (`#[kernel]`, `AdNum`, `Real`, `Dual`, SIMD `Lanes`).
 - `raads-engines`: Monte Carlo path (`paths`) and 1-D PDE (`pde1d`) engines that run a few kernels in their loops and return gradients w.r.t. every model parameter.

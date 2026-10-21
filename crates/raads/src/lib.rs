@@ -1,9 +1,9 @@
 //! Compile-time adjoint algorithmic differentiation.
 //!
 //! Write a branch-free function once, generic over [`AdNum`]; [`#[kernel]`](kernel) emits
-//! straight-line forward and reverse code generic over [`Real`], so one source gives the value,
-//! the gradient in one reverse pass, and with [`Dual`] values Hessian-vector products
-//! (forward-over-reverse). The same code runs on `f64` and on SIMD packs ([`Lanes`]), one
+//! forward and reverse code generic over [`Real`], straight-line apart from its own loops, so
+//! one source gives the value, the gradient in one reverse pass, and with [`Dual`] values
+//! Hessian-vector products (forward-over-reverse). The same code runs on `f64` and on SIMD packs ([`Lanes`]), one
 //! independent evaluation per lane. [`#[kernels]`](kernels) compiles a set of kernels for an
 //! engine that owns the runtime loops (e.g. the `raads-engines` crate).
 //!

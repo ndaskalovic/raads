@@ -1,5 +1,6 @@
-//! Straight-line Rust for one kernel graph, generic over `R: <krate>::Real`, where `krate`
-//! is the path of the `raads` crate as the calling crate names it (usually `::raads`).
+//! Rust for one kernel graph, generic over `R: <krate>::Real`, where `krate` is the path of
+//! the `raads` crate as the calling crate names it (usually `::raads`). Straight-line code,
+//! except for the kernel's own loops.
 //!
 //! Four functions per kernel, all `#[inline(always)]`:
 //! - `eval(inputs..) -> y`
@@ -12,6 +13,12 @@
 //! product contribution stays pending until a second contribution (or the caller's
 //! accumulator) can absorb it as one FMA. A constant factor stays an `f64` (`x * (k)`,
 //! `x.mul_add_k(k, c)`), so `Dual` values never compute with a constant's zero tangent.
+//!
+//! Loops stay loops. Each forward iteration saves the values its reverse reads on a tape
+//! (a `Vec` in `vjp`, `res` after the top-level residuals in `fwd`); the reverse loop runs
+//! the iterations backwards and reads them back. Carried values `c<i>` have adjoints
+//! `ac<i>`, local arrays `m<i>` have adjoint arrays `am<i>`; the adjoints of values defined
+//! outside a loop and used in it are declared before the reverse loop and accumulate.
 
 use crate::passes::Analysis;
 use crate::{Graph, NONE, Op};
@@ -68,6 +75,17 @@ impl Signature {
             Some(_) => format!("a_y[{o}]"),
         }
     }
+    /// Name of the array parameter whose element 0 is input (data) number `first`.
+    fn group(&self, first: usize, data: bool) -> &str {
+        let mut k = 0;
+        for g in self.groups.iter().filter(|g| g.data == data) {
+            if k == first {
+                return &g.name;
+            }
+            k += g.len.unwrap_or(1);
+        }
+        panic!("no parameter starts at input {first} (data: {data})");
+    }
     /// (value access, adjoint access) of differentiable input `i`, or data input `i`.
     fn slot(&self, i: usize, data: bool) -> (String, String) {
         let mut k = i;
@@ -98,9 +116,21 @@ pub enum Kind {
     Bwd,
 }
 
-/// Number of residuals `fwd` saves.
+/// Number of residuals `fwd` saves: the top-level ones, then the loop tape.
 pub fn nres(g: &Graph) -> usize {
-    Analysis::new(g).res.len()
+    let an = Analysis::new(g);
+    an.res.len() + if g.has_loops() { an.tape(g, false) } else { 0 }
+}
+
+/// Where the forward pass saves loop values and the reverse pass reads them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tape {
+    /// Nowhere (`eval`).
+    None,
+    /// `tape: Vec<R>` (`vjp`).
+    Vec,
+    /// `res[tp..]` (`fwd`, `bwd`).
+    Res,
 }
 
 /// Rust source of one function `name` (with visibility/qualifiers `vis`, e.g. `"pub"`);
@@ -124,6 +154,8 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
         params.extend(sig.groups.iter().filter(|g| !g.data).map(|g| sig.adj_param(g)));
     }
     let ret = if kind == Kind::Bwd { String::new() } else { format!(" -> {}", sig.out_ty()) };
+    let loops = g.has_loops();
+    let nres = an.res.len() + if loops { an.tape(g, false) } else { 0 };
     let doc = match kind {
         Kind::Eval => "The kernel's result.",
         Kind::Vjp => "The kernel's result; adds `Jᵀ a_y` to the input adjoints.",
@@ -141,17 +173,27 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
     writeln!(s, "    use {krate}::{{AdNum as _, Real as _}};").unwrap();
     match kind {
         Kind::Eval => {
-            e.forward(&mut s);
+            e.forward(&mut s, Tape::None);
             e.outputs(&mut s);
         }
         Kind::Vjp => {
-            e.forward(&mut s);
-            e.reverse(&mut s);
+            if loops {
+                writeln!(s, "    let mut tape: ::std::vec::Vec<R> = ::std::vec::Vec::with_capacity({});", an.tape(g, true)).unwrap();
+            }
+            e.forward(&mut s, Tape::Vec);
+            if loops {
+                writeln!(s, "    let mut tp = tape.len();").unwrap();
+            }
+            e.reverse(&mut s, Tape::Vec);
             e.outputs(&mut s);
         }
         Kind::Fwd => {
-            e.forward(&mut s);
-            if !an.res.is_empty() {
+            if loops {
+                writeln!(s, "    let res = &mut res[..{nres}];").unwrap();
+                writeln!(s, "    let mut tp = {}usize;", an.res.len()).unwrap();
+            }
+            e.forward(&mut s, Tape::Res);
+            if !an.res.is_empty() && !loops {
                 writeln!(s, "    let res = &mut res[..{}];", an.res.len()).unwrap();
             }
             for (k, &r) in an.res.iter().enumerate() {
@@ -160,7 +202,10 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
             e.outputs(&mut s);
         }
         Kind::Bwd => {
-            if !an.res.is_empty() {
+            if loops {
+                writeln!(s, "    let res = &res[..{nres}];").unwrap();
+                writeln!(s, "    let mut tp = {nres}usize;").unwrap();
+            } else if !an.res.is_empty() {
                 writeln!(s, "    let res = &res[..{}];", an.res.len()).unwrap();
             }
             for (k, &r) in an.res.iter().enumerate() {
@@ -176,7 +221,7 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
                     writeln!(s, "    let v{i}: R::Lanes = {}.value();", sig.slot(j, true).0).unwrap();
                 }
             }
-            e.reverse(&mut s);
+            e.reverse(&mut s, Tape::Res);
         }
     }
     s.push_str("}\n");
@@ -284,16 +329,73 @@ impl Emitter<'_> {
         (n.op == Op::Mul && !(self.konst(n.a).is_some() && self.konst(n.b).is_some())).then(|| (self.fac(n.a), self.fac(n.b)))
     }
 
-    fn forward(&self, s: &mut String) {
+    /// `R` or `R::Lanes`, the type of node `i`.
+    fn ty(&self, i: usize) -> &'static str {
+        if self.act(i) { "R" } else { "R::Lanes" }
+    }
+    /// Value of node `j` as the type of node `i`.
+    fn as_ty(&self, i: usize, j: usize) -> String {
+        if self.act(i) { self.r(j) } else { self.l(j) }
+    }
+    /// The carried values of loop `lp`.
+    fn phis(&self, lp: usize) -> impl Iterator<Item = usize> + '_ {
+        (lp + 1..self.an.ends[lp]).filter(move |&p| self.an.parents[p] == lp && self.g.nodes[p].op == Op::Phi)
+    }
+    /// Element `idx` of an array parameter.
+    fn param(&self, first: usize, data: bool, idx: &crate::Int) -> String {
+        format!("{}[{idx}]", self.sig.group(first, data))
+    }
+
+    fn forward(&self, s: &mut String, tape: Tape) {
         for (i, n) in self.g.nodes.iter().enumerate() {
             if !self.an.live[i] {
                 continue;
             }
-            if self.act(i) {
-                writeln!(s, "    let v{i}: R = {};", self.active_value(n)).unwrap();
-            } else {
-                writeln!(s, "    let v{i}: R::Lanes = {};", self.passive_value(n)).unwrap();
+            match &n.op {
+                Op::Loop(var, lo, hi) => {
+                    for p in self.phis(i).filter(|&p| self.an.live[p]) {
+                        writeln!(s, "    let mut c{p}: {} = {};", self.ty(p), self.as_ty(p, self.g.nodes[p].a)).unwrap();
+                    }
+                    writeln!(s, "    for {var} in {lo}..{hi} {{").unwrap();
+                    continue;
+                }
+                Op::End => {
+                    let lp = self.an.parents[i];
+                    if tape != Tape::None {
+                        for r in self.an.saved(self.g, lp, tape == Tape::Vec) {
+                            let v = self.r(r);
+                            match tape {
+                                Tape::Vec => writeln!(s, "    tape.push({v});").unwrap(),
+                                _ => writeln!(s, "    res[tp] = {v};\n    tp += 1;").unwrap(),
+                            }
+                        }
+                    }
+                    writeln!(s, "    }}").unwrap();
+                    continue;
+                }
+                Op::Phi => writeln!(s, "    let v{i}: {} = c{i};", self.ty(i)).unwrap(),
+                Op::Next => writeln!(s, "    c{} = {};", n.a, self.as_ty(n.a, n.b)).unwrap(),
+                Op::Out => writeln!(s, "    let v{i}: {} = c{};", self.ty(i), n.a).unwrap(),
+                Op::Array(len) => writeln!(s, "    let mut m{i}: [{}; {len}] = [{}; {len}];", self.ty(i), self.as_ty(i, n.a)).unwrap(),
+                Op::Load(idx) => writeln!(s, "    let v{i}: {} = m{}[{idx}];", self.ty(i), n.a).unwrap(),
+                Op::Store(idx) => writeln!(s, "    m{}[{idx}] = {};", n.a, self.as_ty(n.a, n.b)).unwrap(),
+                Op::Param { first, data, idx, .. } => writeln!(s, "    {}", self.load_param(i, *first, *data, idx)).unwrap(),
+                Op::Int(idx) => writeln!(s, "    {}", Self::load_int(i, idx)).unwrap(),
+                _ if self.act(i) => writeln!(s, "    let v{i}: R = {};", self.active_value(n)).unwrap(),
+                _ => writeln!(s, "    let v{i}: R::Lanes = {};", self.passive_value(n)).unwrap(),
             }
+        }
+    }
+
+    /// `let v<i> = ..;` for an integer as a number.
+    fn load_int(i: usize, idx: &crate::Int) -> String {
+        format!("let v{i}: R::Lanes = <R::Lanes as ::core::convert::From<f64>>::from({idx} as f64);")
+    }
+    /// `let v<i> = ..;` for an element of an array parameter.
+    fn load_param(&self, i: usize, first: usize, data: bool, idx: &crate::Int) -> String {
+        match data {
+            true => format!("let v{i}: R::Lanes = {}.value();", self.param(first, data, idx)),
+            false => format!("let v{i}: R = {};", self.param(first, data, idx)),
         }
     }
 
@@ -340,6 +442,7 @@ impl Emitter<'_> {
             }
             Op::Stop if self.act(a) => format!("v{a}.value()"),
             Op::Stop => format!("v{a}"),
+            _ => unreachable!("loop operations are emitted by `forward`"),
         }
     }
 
@@ -389,6 +492,7 @@ impl Emitter<'_> {
             Op::Relu => format!("v{a}.relu()"),
             Op::SelGt => format!("R::select_gt({}, {}, {}, {})", self.r(a), self.r(b), self.r(n.c), self.r(n.d)),
             Op::Data(_) | Op::Const(_) | Op::Stop => unreachable!("leaves other than inputs, and detach, are passive"),
+            _ => unreachable!("loop operations are emitted by `forward`"),
         }
     }
 
@@ -400,20 +504,130 @@ impl Emitter<'_> {
         }
     }
 
-    fn reverse(&self, s: &mut String) {
+    /// Adjoint arrays of the local arrays defined directly in loop `lp` (or at the top
+    /// level: `NONE`), zero at the start of its reverse sweep.
+    fn adjoint_arrays(&self, s: &mut String, lp: usize) {
+        for (i, n) in self.g.nodes.iter().enumerate() {
+            if let Op::Array(len) = n.op
+                && self.an.parents[i] == lp
+                && self.an.need[i]
+            {
+                writeln!(s, "    let mut am{i}: [R; {len}] = [R::neg_zero(); {len}];").unwrap();
+            }
+        }
+    }
+
+    /// Operands of node `n` that receive adjoint contributions from it.
+    fn adjoint_operands(n: &crate::Node) -> Vec<usize> {
+        match n.op {
+            Op::SelGt => vec![n.c, n.d],
+            Op::Next | Op::Store(_) => vec![n.b],
+            Op::Out | Op::Load(_) | Op::Loop(..) | Op::End | Op::Param { .. } | Op::Int(_) => vec![],
+            _ => n.args().collect(),
+        }
+    }
+
+    fn reverse(&self, s: &mut String, tape: Tape) {
         let (g, need) = (self.g, &self.an.need);
         let mut ad = Adj { seen: vec![false; g.len()], pending: vec![None; g.len()], need };
+        let buf = if tape == Tape::Vec { "tape" } else { "res" };
+        self.adjoint_arrays(s, NONE);
         for (o, &i) in g.outs.iter().enumerate() {
             ad.add(s, i, self.sig.a_y(o), false);
         }
         for i in (0..g.len()).rev() {
+            let n = &g.nodes[i];
+            let (a, b) = (n.a, n.b);
+            match &n.op {
+                Op::End => {
+                    let lp = self.an.parents[i];
+                    let Op::Loop(var, lo, hi) = &g.nodes[lp].op else { unreachable!() };
+                    for p in self.phis(lp).filter(|&p| need[p]) {
+                        let out = (i + 1..g.len()).find(|&o| g.nodes[o].op == Op::Out && g.nodes[o].a == p);
+                        let init = match out {
+                            Some(o) if ad.seen[o] => {
+                                ad.materialise(s, o);
+                                format!("a{o}")
+                            }
+                            _ => "R::neg_zero()".into(),
+                        };
+                        writeln!(s, "    let mut ac{p}: R = {init};").unwrap();
+                    }
+                    // adjoints of values from outside the loop accumulate over its iterations
+                    let mut outer: Vec<usize> =
+                        (lp + 1..i).flat_map(|j| Self::adjoint_operands(&g.nodes[j])).filter(|&j| j < lp && need[j]).collect();
+                    outer.sort_unstable();
+                    outer.dedup();
+                    for j in outer {
+                        ad.declare(s, j);
+                    }
+                    writeln!(s, "    for {var} in ({lo}..{hi}).rev() {{").unwrap();
+                    let saved = self.an.saved(g, lp, tape == Tape::Vec);
+                    if !saved.is_empty() {
+                        writeln!(s, "    tp -= {};", saved.len()).unwrap();
+                    }
+                    for (k, &r) in saved.iter().enumerate() {
+                        match self.act(r) {
+                            true => writeln!(s, "    let v{r}: R = {buf}[tp + {k}];").unwrap(),
+                            false => writeln!(s, "    let v{r}: R::Lanes = {buf}[tp + {k}].value();").unwrap(),
+                        }
+                    }
+                    for r in self.an.rematerialised(g, lp, tape == Tape::Vec) {
+                        match &g.nodes[r].op {
+                            Op::Param { first, data, idx, .. } => writeln!(s, "    {}", self.load_param(r, *first, *data, idx)).unwrap(),
+                            Op::Int(idx) => writeln!(s, "    {}", Self::load_int(r, idx)).unwrap(),
+                            _ => unreachable!(),
+                        }
+                    }
+                    self.adjoint_arrays(s, lp);
+                    continue;
+                }
+                Op::Loop(..) => {
+                    writeln!(s, "    }}").unwrap();
+                    for p in self.phis(i).filter(|&p| need[p]) {
+                        ad.add(s, g.nodes[p].a, format!("ac{p}"), false);
+                    }
+                    continue;
+                }
+                Op::Phi => {
+                    if need[i] {
+                        ad.materialise(s, i);
+                        let v = if ad.seen[i] { format!("a{i}") } else { "R::neg_zero()".into() };
+                        writeln!(s, "    ac{i} = {v};").unwrap();
+                    }
+                    continue;
+                }
+                Op::Next => {
+                    if need[a] {
+                        ad.add(s, b, format!("ac{a}"), false);
+                    }
+                    continue;
+                }
+                Op::Store(idx) => {
+                    if need[a] {
+                        ad.add(s, b, format!("am{a}[{idx}]"), false);
+                        writeln!(s, "    am{a}[{idx}] = R::neg_zero();").unwrap();
+                    }
+                    continue;
+                }
+                Op::Array(_) => {
+                    if need[i] {
+                        ad.add(s, a, format!("am{i}.iter().fold(R::neg_zero(), |s, &x| s + x)"), false);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             if !need[i] || !ad.seen[i] {
                 continue;
             }
-            let n = &g.nodes[i];
-            let (a, b) = (n.a, n.b);
-            if let Op::Input(j) = n.op {
-                let acc = self.sig.slot(j, false).1;
+            let acc = match &n.op {
+                Op::Input(j) => Some(self.sig.slot(*j, false).1),
+                Op::Param { first, idx, .. } => Some(format!("a_{}", self.param(*first, false, idx))),
+                Op::Load(idx) => Some(format!("am{a}[{idx}]")),
+                _ => None,
+            };
+            if let Some(acc) = acc {
                 match ad.pending[i].take() {
                     Some((x, y)) => writeln!(s, "    {acc} = {};", fused(&x, &y, &acc)).unwrap(),
                     None => writeln!(s, "    {acc} += a{i};").unwrap(),
@@ -461,7 +675,7 @@ impl Emitter<'_> {
                     ad.add(s, n.c, format!("R::select_gt({va}, {vb}, {ai}, R::splat(0.0_f64))"), false);
                     ad.add(s, n.d, format!("R::select_gt({va}, {vb}, R::splat(0.0_f64), {ai})"), false);
                 }
-                Op::Input(_) | Op::Data(_) | Op::Const(_) | Op::Stop => {}
+                _ => {}
             }
         }
     }
@@ -476,6 +690,16 @@ struct Adj<'a> {
 }
 
 impl Adj<'_> {
+    /// Declare the adjoint of `j` now (zero if it has no contribution yet), so later
+    /// contributions, e.g. from inside a loop, accumulate into it.
+    fn declare(&mut self, s: &mut String, j: usize) {
+        if self.seen[j] {
+            self.materialise(s, j);
+        } else {
+            self.seen[j] = true;
+            writeln!(s, "    let mut a{j}: R = R::neg_zero();").unwrap();
+        }
+    }
     fn materialise(&mut self, s: &mut String, j: usize) {
         if let Some((x, y)) = self.pending[j].take() {
             writeln!(s, "    let mut a{j}: R = {};", prod(&x, &y)).unwrap();

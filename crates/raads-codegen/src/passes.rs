@@ -2,39 +2,76 @@
 
 use crate::{Graph, Op};
 
-/// Node depends on a differentiable input.
+/// Node depends on a differentiable input. A local array is active if any element stored in
+/// it is, a carried value if its initial value or any update is.
 pub fn active(g: &Graph) -> Vec<bool> {
     let mut act = vec![false; g.len()];
-    for (i, n) in g.nodes.iter().enumerate() {
-        act[i] = match n.op {
-            Op::Input(_) => true,
-            Op::Stop => false,
-            _ if n.is_leaf() => false,
-            _ => n.args().any(|a| act[a]),
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut set = |act: &mut Vec<bool>, j: usize| {
+            if !act[j] {
+                act[j] = true;
+                changed = true;
+            }
         };
+        for (i, n) in g.nodes.iter().enumerate() {
+            let a = match &n.op {
+                Op::Input(_) => true,
+                Op::Param { data, .. } => !data,
+                Op::Stop | Op::Loop(..) | Op::End => false,
+                _ if n.is_leaf() => false,
+                Op::Next | Op::Store(_) => {
+                    if act[n.b] {
+                        set(&mut act, n.a);
+                    }
+                    false
+                }
+                Op::Phi | Op::Array(_) | Op::Load(_) | Op::Out => act[n.a],
+                _ => n.args().any(|a| act[a]),
+            };
+            if a {
+                set(&mut act, i);
+            }
+        }
     }
     act
 }
 
 /// Node reaches an output through a differentiable operand (the mask operands of
-/// `SelGt` and the operand of `Stop` receive no adjoint).
+/// `SelGt` and the operand of `Stop` receive no adjoint). An element stored in a useful
+/// array, and the update of a useful carried value, are useful.
 pub fn useful(g: &Graph) -> Vec<bool> {
     let mut use_ = vec![false; g.len()];
     for &o in &g.outs {
         use_[o] = true;
     }
-    for i in (0..g.len()).rev() {
-        let n = &g.nodes[i];
-        if !use_[i] || n.is_leaf() || n.op == Op::Stop {
-            continue;
-        }
-        if n.op == Op::SelGt {
-            use_[n.c] = true;
-            use_[n.d] = true;
-        } else {
-            for a in [n.a, n.b] {
-                if a != crate::NONE {
-                    use_[a] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut set = |use_: &mut Vec<bool>, j: usize| {
+            if j != crate::NONE && !use_[j] {
+                use_[j] = true;
+                changed = true;
+            }
+        };
+        for i in (0..g.len()).rev() {
+            let n = &g.nodes[i];
+            match n.op {
+                Op::Next | Op::Store(_) => {
+                    if use_[n.a] {
+                        set(&mut use_, n.b);
+                    }
+                }
+                _ if !use_[i] || n.is_leaf() => {}
+                Op::Stop | Op::Param { .. } | Op::Loop(..) | Op::End => {}
+                Op::SelGt => {
+                    set(&mut use_, n.c);
+                    set(&mut use_, n.d);
+                }
+                _ => {
+                    set(&mut use_, n.a);
+                    set(&mut use_, n.b);
                 }
             }
         }
@@ -48,15 +85,31 @@ pub fn need(g: &Graph) -> Vec<bool> {
 }
 
 /// Node value is needed by the forward evaluation of the outputs (all operands count).
+/// Loop markers are always live, stores into live arrays and updates of live carried values
+/// too.
 pub fn live(g: &Graph) -> Vec<bool> {
     let mut l = vec![false; g.len()];
     for &o in &g.outs {
         l[o] = true;
     }
-    for i in (0..g.len()).rev() {
-        if l[i] {
-            for a in g.nodes[i].args() {
-                l[a] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..g.len()).rev() {
+            let n = &g.nodes[i];
+            let keep = match n.op {
+                Op::Loop(..) | Op::End => true,
+                Op::Next | Op::Store(_) => l[n.a],
+                _ => l[i],
+            };
+            if !keep {
+                continue;
+            }
+            for j in std::iter::once(i).chain(n.args()) {
+                if !l[j] {
+                    l[j] = true;
+                    changed = true;
+                }
             }
         }
     }
@@ -99,10 +152,47 @@ pub fn reads(g: &Graph, need: &[bool]) -> Vec<bool> {
     rd
 }
 
-/// Values `fwd` saves for `bwd`: read by the reverse sweep and not rematerialised
-/// (data and constants are), in node order.
+/// Recomputed by the reverse sweep instead of saved: data and constants, and with `inputs`
+/// (a `vjp`, which has the inputs) elements of input arrays read in a loop.
+pub fn remat(g: &Graph, i: usize, inputs: bool) -> bool {
+    match g.nodes[i].op {
+        Op::Data(_) | Op::Const(_) | Op::Int(_) => true,
+        Op::Param { data, .. } => data || inputs,
+        _ => false,
+    }
+}
+
+/// Values `fwd` saves for `bwd` at the top level: read by the reverse sweep and not
+/// rematerialised, in node order.
 pub fn residuals(g: &Graph, reads: &[bool]) -> Vec<usize> {
-    (0..g.len()).filter(|&i| reads[i] && !matches!(g.nodes[i].op, Op::Data(_) | Op::Const(_))).collect()
+    let parents = g.parents();
+    (0..g.len()).filter(|&i| reads[i] && parents[i] == crate::NONE && !remat(g, i, false)).collect()
+}
+
+/// Total number of executions of each loop body ([`Op::Loop`] markers; 0 for other nodes).
+/// Errors if a bound cannot be evaluated (overflow, division by zero).
+pub fn runs(g: &Graph) -> Result<Vec<usize>, String> {
+    fn go(g: &Graph, ends: &[usize], from: usize, to: usize, vars: &mut Vec<(String, usize)>, runs: &mut [usize]) -> Result<(), String> {
+        let mut i = from;
+        while i < to {
+            if let Op::Loop(var, lo, hi) = &g.nodes[i].op {
+                let bad = || format!("cannot evaluate the bounds `{lo}..{hi}` of loop `{var}`");
+                let (lo, hi) = (lo.eval(vars).ok_or_else(bad)?, hi.eval(vars).ok_or_else(bad)?);
+                for k in lo..hi {
+                    runs[i] += 1;
+                    vars.push((var.clone(), k));
+                    go(g, ends, i + 1, ends[i], vars, runs)?;
+                    vars.pop();
+                }
+                i = ends[i];
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+    let mut runs = vec![0; g.len()];
+    go(g, &g.ends(), 0, g.len(), &mut Vec::new(), &mut runs)?;
+    Ok(runs)
 }
 
 /// All analyses of one graph.
@@ -118,6 +208,10 @@ pub struct Analysis {
     pub reads: Vec<bool>,
     /// See [`residuals`].
     pub res: Vec<usize>,
+    /// See [`Graph::parents`].
+    pub parents: Vec<usize>,
+    /// See [`Graph::ends`].
+    pub ends: Vec<usize>,
 }
 
 impl Analysis {
@@ -127,7 +221,26 @@ impl Analysis {
         let live = live(g);
         let reads = reads(g, &need);
         let res = residuals(g, &reads);
-        Analysis { active: active(g), need, live, reads, res }
+        Analysis { active: active(g), need, live, reads, res, parents: g.parents(), ends: g.ends() }
+    }
+    /// Values one iteration of `lp` saves on the tape (read by the reverse sweep, defined
+    /// directly in the loop body, not rematerialised), in node order. `inputs`: see [`remat`].
+    pub fn saved(&self, g: &Graph, lp: usize, inputs: bool) -> Vec<usize> {
+        (lp + 1..self.ends[lp]).filter(|&i| self.reads[i] && self.parents[i] == lp && !remat(g, i, inputs)).collect()
+    }
+    /// Values of the loop body `lp` the reverse sweep recomputes at the start of an iteration
+    /// (parameter elements and loop indices; constants are inlined where they are used).
+    pub fn rematerialised(&self, g: &Graph, lp: usize, inputs: bool) -> Vec<usize> {
+        (lp + 1..self.ends[lp])
+            .filter(|&i| {
+                self.reads[i] && self.parents[i] == lp && matches!(g.nodes[i].op, Op::Param { .. } | Op::Int(_)) && remat(g, i, inputs)
+            })
+            .collect()
+    }
+    /// Length of the loop tape: saved values over all iterations of all loops.
+    pub fn tape(&self, g: &Graph, inputs: bool) -> usize {
+        let runs = runs(g).expect("loop bounds");
+        (0..g.len()).filter(|&i| matches!(g.nodes[i].op, Op::Loop(..))).map(|l| runs[l] * self.saved(g, l, inputs).len()).sum()
     }
 }
 

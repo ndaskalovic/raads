@@ -1,9 +1,10 @@
-//! raads on the Heston MC and SABR calibration workloads of auto-differentiation/ad-benchmarks
+//! raads on the Heston MC, SABR calibration and LIBOR swaption workloads of auto-differentiation/ad-benchmarks
 //! (the suite in XAD's README), with that suite's inputs, sizes and timing: median of 10 runs
 //! after 3 warm-ups, f64. Inputs and XAD's results come from `ad-benchmarks/reference.cpp`
 //! (target/adbench.bin, target/adbench_reference.txt); results are checked against XAD first.
 //! Prints every lane width and writes the suite's CSV rows to target/adbench_raads.csv: `raads`
-//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR). Run by `ad-benchmarks/run.sh`.
+//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR and LIBOR). Run by
+//! `ad-benchmarks/run.sh`.
 
 use raads::lanes::{F64x2, F64x4, F64x8, F64x16};
 use raads::prelude::*;
@@ -16,6 +17,9 @@ const STEPS: usize = 100;
 const EXPIRIES: usize = 5;
 const STRIKES: usize = 20;
 const ITERS: usize = 500;
+/// LIBOR rates (src/libor_swaption.hpp: 80) and time steps (normals per path).
+const RATES: usize = 80;
+const LSTEPS: usize = 40;
 /// S0, K, T, r, v0, kappa, theta, xi (src/heston.hpp)
 const HESTON: [f64; 8] = [100.0, 105.0, 1.0, 0.05, 0.04, 2.0, 0.04, 0.3];
 
@@ -51,6 +55,60 @@ impl Heston {
     pub fn functional<N: AdNum>(s: [N; 2], p: [N; 8], _c: [N; 6]) -> N {
         (-p[3] * p[2]).exp() * (s[0] - p[1]).relu()
     }
+}
+
+/// One LIBOR market model path and the swaption portfolio's value on it
+/// (src/libor_swaption.hpp, after Giles). p: delta, lambda[80], L0[80].
+#[kernel]
+pub fn libor<N: AdNum>(p: [N; 161], #[data] z: [N; 40]) -> N {
+    let delta = p[0];
+    let mut l = [N::from(0.0); 80];
+    for i in 0..80 {
+        l[i] = p[81 + i];
+    }
+    for n in 0..40 {
+        let sqez = delta.sqrt() * z[n];
+        let mut v = N::from(0.0);
+        for i in n + 1..80 {
+            let lam = p[1 + i - n - 1];
+            let con1 = delta * lam;
+            v = v + con1 * l[i] / (delta * l[i] + 1.0);
+            l[i] = l[i] * (con1 * v + lam * (sqez - con1 * 0.5)).exp();
+        }
+    }
+    // discount factors and annuities from the end of the path
+    let mut b = N::from(1.0);
+    let mut s = N::from(0.0);
+    let mut bs = [N::from(0.0); 80];
+    let mut ss = [N::from(0.0); 80];
+    for n in 40..80 {
+        b = b / (delta * l[n] + 1.0);
+        s = s + delta * b;
+        bs[n] = b;
+        ss[n] = s;
+    }
+    // receiver swaptions: maturities 4, 8, 20, 28, 40 (index 39 + maturity), swap rates
+    // 4.5%, 5%, 5.5%
+    let mut v = N::from(0.0);
+    v = v - (bs[43] + ss[43] * 0.045 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[43] + ss[43] * 0.05 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[43] + ss[43] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[47] + ss[47] * 0.045 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[47] + ss[47] * 0.05 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[47] + ss[47] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[59] + ss[59] * 0.045 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[59] + ss[59] * 0.05 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[59] + ss[59] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[67] + ss[67] * 0.045 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[67] + ss[67] * 0.05 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[67] + ss[67] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[79] + ss[79] * 0.045 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[79] + ss[79] * 0.05 - 1.0).minimum(0.0) * 100.0;
+    v = v - (bs[79] + ss[79] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    for n in 0..40 {
+        v = v / (delta * l[n] + 1.0);
+    }
+    v
 }
 
 /// Squared error of the Hagan 2002 vol against the market vol at one strike (src/sabr.hpp,
@@ -212,6 +270,49 @@ fn sabr<L: Lanes<Elem = f64>>(s: &Sabr, want0: &[f64], want_sum: &[f64]) -> (f64
     (primal, grad)
 }
 
+/// delta, lambda[80], L0[80] (src/libor_swaption.hpp, `defaultMarket`).
+fn libor_params<L: Lanes>() -> [L; 161] {
+    std::array::from_fn(|i| {
+        L::from(if i == 0 {
+            0.05
+        } else if i <= RATES {
+            0.2
+        } else {
+            0.05
+        })
+    })
+}
+
+/// Normals per block of W paths: step `k`, lane `l`.
+fn libor_normals<L: Lanes>(raw: &[f64]) -> Vec<[L; LSTEPS]> {
+    raw.chunks(LSTEPS * L::W).map(|block| std::array::from_fn(|k| L::from_fn(|l| block[l * LSTEPS + k]))).collect()
+}
+
+fn libor_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
+    let z = libor_normals::<L>(raw);
+    let p = libor_params::<L>();
+    let grad = |p: &[L; 161]| {
+        let mut g = [L::from(0.0); 161];
+        let mut v = L::from(0.0);
+        for zb in &z {
+            v += libor::vjp(p, zb, L::from(1.0), &mut g);
+        }
+        (v, g)
+    };
+    let (v, g) = grad(&p);
+    let got: Vec<f64> = std::iter::once(v).chain(g).map(|x| x.sum() / PATHS as f64).collect();
+    check(&format!("libor W={}", L::W), &got, want);
+    let primal = median_ms(3, 10, || {
+        let p = black_box(&p);
+        black_box(z.iter().fold(L::from(0.0), |v, zb| v + libor::eval(p, zb)));
+    });
+    let grad = median_ms(3, 10, || {
+        black_box(grad(black_box(&p)));
+    });
+    println!("raads libor W={:2}: primal {primal:.3} ms, gradient {grad:.3} ms", L::W);
+    (primal, grad)
+}
+
 fn main() {
     let bytes = std::fs::read("target/adbench.bin").expect("run ad-benchmarks/reference.cpp first (benchmarks/ad-benchmarks/run.sh)");
     let all: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b)).collect();
@@ -228,6 +329,7 @@ fn main() {
     }
     s.init = std::array::from_fn(|_| it.next().unwrap());
     s.dp = (0..ITERS).map(|_| std::array::from_fn(|_| it.next().unwrap())).collect();
+    let lz: Vec<f64> = it.by_ref().take(PATHS * LSTEPS).collect();
     assert!(it.next().is_none(), "unexpected trailing data");
 
     let refs = std::fs::read_to_string("target/adbench_reference.txt").expect("XAD reference values");
@@ -245,10 +347,21 @@ fn main() {
     let s1 = sabr::<f64>(&s, &s0, &ssum);
     sabr::<F64x2>(&s, &s0, &ssum);
     let s4 = sabr::<F64x4>(&s, &s0, &ssum);
-    let rows: String =
-        [("raads", "HestonMC", h1), ("raads SIMD", "HestonMC", h8), ("raads", "SABRCalib", s1), ("raads SIMD", "SABRCalib", s4)]
-            .iter()
-            .map(|(lib, bench, (primal, grad))| format!("{lib},{bench},{primal:.6},{grad:.6}\n"))
-            .collect();
+    let l = line("libor");
+    let l1 = libor_bench::<f64>(&lz, &l);
+    libor_bench::<F64x2>(&lz, &l);
+    let l4 = libor_bench::<F64x4>(&lz, &l);
+    libor_bench::<F64x8>(&lz, &l);
+    let rows: String = [
+        ("raads", "HestonMC", h1),
+        ("raads SIMD", "HestonMC", h8),
+        ("raads", "SABRCalib", s1),
+        ("raads SIMD", "SABRCalib", s4),
+        ("raads", "LiborSwaption", l1),
+        ("raads SIMD", "LiborSwaption", l4),
+    ]
+    .iter()
+    .map(|(lib, bench, (primal, grad))| format!("{lib},{bench},{primal:.6},{grad:.6}\n"))
+    .collect();
     std::fs::write("target/adbench_raads.csv", rows).unwrap();
 }

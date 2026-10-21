@@ -1,9 +1,9 @@
 //! The operations a kernel may use.
 //!
-//! Kernels are written once, generic over `N: AdNum`. `#[kernel]` turns them into
-//! straight-line forward and reverse code; the same source also runs eagerly on any
-//! [`Real`](crate::Real) (`f64`, SIMD packs, [`Dual`](crate::Dual)) and on the graph
-//! tracer used to test the macro. Comparisons exist only through [`AdNum::select_gt`],
+//! Kernels are written once, generic over `N: AdNum`. `#[kernel]` turns them into forward
+//! and reverse code (straight-line apart from their own loops); the same source also runs
+//! eagerly on any [`Real`](crate::Real) (`f64`, SIMD packs, [`Dual`](crate::Dual)) and on the
+//! graph tracer used to test the macro. Comparisons exist only through [`AdNum::select_gt`],
 //! so a kernel is branch-free on differentiable values and its graph never changes.
 
 use std::ops::{Add, Div, Mul, Neg, Sub};
