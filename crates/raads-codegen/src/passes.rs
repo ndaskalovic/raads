@@ -152,7 +152,8 @@ pub fn reads(g: &Graph, need: &[bool]) -> Vec<bool> {
     rd
 }
 
-/// Recomputed by the reverse sweep instead of saved: data and constants, and with `inputs`
+/// Recomputed by the reverse sweep instead of saved: data, constants and loop indices as
+/// numbers, and with `inputs`
 /// (a `vjp`, which has the inputs) elements of input arrays read in a loop.
 pub fn remat(g: &Graph, i: usize, inputs: bool) -> bool {
     match g.nodes[i].op {
@@ -170,7 +171,8 @@ pub fn residuals(g: &Graph, reads: &[bool]) -> Vec<usize> {
 }
 
 /// Total number of executions of each loop body ([`Op::Loop`] markers; 0 for other nodes).
-/// Errors if a bound cannot be evaluated (overflow, division by zero).
+/// Errors if a bound cannot be evaluated (overflow, division by zero). Walks the iterations of
+/// every loop that contains loops; an innermost loop only adds its trip count.
 pub fn runs(g: &Graph) -> Result<Vec<usize>, String> {
     fn go(g: &Graph, ends: &[usize], from: usize, to: usize, vars: &mut Vec<(String, usize)>, runs: &mut [usize]) -> Result<(), String> {
         let mut i = from;
@@ -178,6 +180,11 @@ pub fn runs(g: &Graph) -> Result<Vec<usize>, String> {
             if let Op::Loop(var, lo, hi) = &g.nodes[i].op {
                 let bad = || format!("cannot evaluate the bounds `{lo}..{hi}` of loop `{var}`");
                 let (lo, hi) = (lo.eval(vars).ok_or_else(bad)?, hi.eval(vars).ok_or_else(bad)?);
+                if !g.nodes[i + 1..ends[i]].iter().any(|n| matches!(n.op, Op::Loop(..))) {
+                    runs[i] += hi.saturating_sub(lo);
+                    i = ends[i] + 1;
+                    continue;
+                }
                 for k in lo..hi {
                     runs[i] += 1;
                     vars.push((var.clone(), k));
@@ -212,6 +219,8 @@ pub struct Analysis {
     pub parents: Vec<usize>,
     /// See [`Graph::ends`].
     pub ends: Vec<usize>,
+    /// See [`runs`].
+    pub runs: Vec<usize>,
 }
 
 impl Analysis {
@@ -221,7 +230,8 @@ impl Analysis {
         let live = live(g);
         let reads = reads(g, &need);
         let res = residuals(g, &reads);
-        Analysis { active: active(g), need, live, reads, res, parents: g.parents(), ends: g.ends() }
+        let runs = runs(g).expect("loop bounds are checked by the front end");
+        Analysis { active: active(g), need, live, reads, res, parents: g.parents(), ends: g.ends(), runs }
     }
     /// Values one iteration of `lp` saves on the tape (read by the reverse sweep, defined
     /// directly in the loop body, not rematerialised), in node order. `inputs`: see [`remat`].
@@ -239,8 +249,7 @@ impl Analysis {
     }
     /// Length of the loop tape: saved values over all iterations of all loops.
     pub fn tape(&self, g: &Graph, inputs: bool) -> usize {
-        let runs = runs(g).expect("loop bounds");
-        (0..g.len()).filter(|&i| matches!(g.nodes[i].op, Op::Loop(..))).map(|l| runs[l] * self.saved(g, l, inputs).len()).sum()
+        (0..g.len()).filter(|&i| matches!(g.nodes[i].op, Op::Loop(..))).map(|l| self.runs[l] * self.saved(g, l, inputs).len()).sum()
     }
 }
 

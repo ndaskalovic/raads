@@ -155,7 +155,6 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
     }
     let ret = if kind == Kind::Bwd { String::new() } else { format!(" -> {}", sig.out_ty()) };
     let loops = g.has_loops();
-    let nres = an.res.len() + if loops { an.tape(g, false) } else { 0 };
     let doc = match kind {
         Kind::Eval => "The kernel's result.",
         Kind::Vjp => "The kernel's result; adds `Jᵀ a_y` to the input adjoints.",
@@ -189,7 +188,7 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
         }
         Kind::Fwd => {
             if loops {
-                writeln!(s, "    let res = &mut res[..{nres}];").unwrap();
+                writeln!(s, "    let res = &mut res[..{}];", an.res.len() + an.tape(g, false)).unwrap();
                 writeln!(s, "    let mut tp = {}usize;", an.res.len()).unwrap();
             }
             e.forward(&mut s, Tape::Res);
@@ -203,6 +202,7 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
         }
         Kind::Bwd => {
             if loops {
+                let nres = an.res.len() + an.tape(g, false);
                 writeln!(s, "    let res = &res[..{nres}];").unwrap();
                 writeln!(s, "    let mut tp = {nres}usize;").unwrap();
             } else if !an.res.is_empty() {
@@ -543,7 +543,8 @@ impl Emitter<'_> {
                     let lp = self.an.parents[i];
                     let Op::Loop(var, lo, hi) = &g.nodes[lp].op else { unreachable!() };
                     for p in self.phis(lp).filter(|&p| need[p]) {
-                        let out = (i + 1..g.len()).find(|&o| g.nodes[o].op == Op::Out && g.nodes[o].a == p);
+                        // the loop's `Out`s sit right after its `End`
+                        let out = (i + 1..g.len()).take_while(|&o| g.nodes[o].op == Op::Out).find(|&o| g.nodes[o].a == p);
                         let init = match out {
                             Some(o) if ad.seen[o] => {
                                 ad.materialise(s, o);

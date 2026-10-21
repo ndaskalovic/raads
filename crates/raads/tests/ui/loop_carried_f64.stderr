@@ -1,0 +1,15 @@
+error: `c` is a plain f64 changed in a loop: start it as `N::from(..)`
+ --> tests/ui/loop_carried_f64.rs:6:5
+  |
+6 | /     for _i in 0..3 {
+7 | |         c = c * 2.0;
+8 | |     }
+  | |_____^
+
+warning: unused import: `AdNum`
+ --> tests/ui/loop_carried_f64.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

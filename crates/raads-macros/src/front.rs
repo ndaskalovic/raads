@@ -84,6 +84,8 @@ pub struct Builder {
     /// (array, index source) → node. Reading an element twice gives the same node, as it
     /// does in the eager function.
     elems: HashMap<(usize, String), usize>,
+    /// Variables the innermost loop carries to its next iteration.
+    carried: Vec<String>,
     /// The kernel's number type parameter and the path of `raads`.
     n: Ident,
     krate: TokenStream,
@@ -103,6 +105,7 @@ impl Builder {
             params: HashMap::new(),
             ints: Vec::new(),
             elems: HashMap::new(),
+            carried: Vec::new(),
             n: n.clone(),
             krate: krate.clone(),
         };
@@ -197,6 +200,9 @@ impl Builder {
                         return err(l.span(), "`let ... else` is not supported in a kernel");
                     }
                     let (v, e) = self.expr(&init.expr)?;
+                    if has_mem(&v) && !matches!(&*init.expr, Expr::Repeat(_)) {
+                        return err(init.expr.span(), "copying a local array is not supported: index it instead");
+                    }
                     self.bind(&l.pat, v)?;
                     let pat = &l.pat;
                     out.extend(quote_spanned!(l.span()=> let #pat = #e;));
@@ -226,6 +232,9 @@ impl Builder {
                         _ => {}
                     }
                     let (v, e) = self.expr(&a.right)?;
+                    if has_mem(&v) {
+                        return err(a.right.span(), "copying a local array is not supported: index it instead");
+                    }
                     self.set(name, v, a.left.span())?;
                     let l = &a.left;
                     out.extend(quote!(#l = #e;));
@@ -257,7 +266,8 @@ impl Builder {
         let mut inits = Vec::new();
         for name in &carried {
             match &self.env[name] {
-                v @ (Val::Node(_) | Val::F(_)) => inits.push(self.node(&v.clone(), f.span())?),
+                Val::Node(v) => inits.push(*v),
+                Val::F(_) => return err(f.span(), &format!("`{name}` is a plain f64 changed in a loop: start it as `N::from(..)`")),
                 _ => return err(f.span(), &format!("`{name}` is an array: assign a local array by element in a loop")),
             }
         }
@@ -269,7 +279,9 @@ impl Builder {
             self.env.insert(name.clone(), Val::Node(p));
         }
         self.ints.push(var);
+        let outer = std::mem::replace(&mut self.carried, carried.clone());
         let body = self.stmts(&f.body.stmts);
+        self.carried = outer;
         self.ints.pop();
         let body = body?;
         for (name, &p) in carried.iter().zip(&phis) {
@@ -323,6 +335,9 @@ impl Builder {
 
     fn bind(&mut self, pat: &Pat, v: Val) -> Result<()> {
         match (pat, v) {
+            (Pat::Ident(p), _) if self.carried.contains(&p.ident.to_string()) => {
+                err(p.span(), &format!("`{}` is carried to the next iteration: a `let` here would hide it, use another name", p.ident))
+            }
             (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span()),
             (Pat::Type(t), v) => self.bind(&t.pat, v),
             (Pat::Wild(_), _) => Ok(()),
@@ -753,6 +768,15 @@ impl Builder {
             g.outs = vec![#(#outs),*];
             g
         }
+    }
+}
+
+/// `v` is or contains a local array.
+fn has_mem(v: &Val) -> bool {
+    match v {
+        Val::Mem(_) => true,
+        Val::Arr(vs) => vs.iter().any(has_mem),
+        _ => false,
     }
 }
 

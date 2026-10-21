@@ -1,6 +1,6 @@
 //! A graph with loops as the straight-line graph that executing it records.
 
-use crate::{Graph, NONE, Node, Op};
+use crate::{Graph, NONE, Op};
 
 /// Runs the loops, array accesses and carried values of `g` at expansion time and records
 /// the remaining operations in execution order: the graph the runtime tracer records for
@@ -75,10 +75,7 @@ impl Unroll<'_> {
                     let j = self.g.nodes.iter().position(|m| m.op == leaf).expect("parameter leaf");
                     self.map[i] = self.map[j];
                 }
-                op => {
-                    let m = Node::new(op.clone(), arg(n.a), arg(n.b), arg(n.c), arg(n.d));
-                    self.map[i] = self.out.push(m.op, m.a, m.b, m.c, m.d);
-                }
+                op => self.map[i] = self.out.push(op.clone(), arg(n.a), arg(n.b), arg(n.c), arg(n.d)),
             }
             i += 1;
         }

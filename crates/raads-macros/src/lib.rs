@@ -68,16 +68,20 @@ pub fn check_kernels(input: TokenStream) -> TokenStream {
 /// The body is `let` bindings, assignments, `for` loops and a final value using `+ - * /`,
 /// `exp ln sqrt powf relu detach maximum minimum smooth_relu`, `N::select_gt(a, b, x, y)`,
 /// `N::from(k)` and `f64` constants: literals, paths (`Self::EPS`, `std::f64::consts::PI`)
-/// and SCREAMING_CASE names; any other bare name must be a parameter or a local.
+/// and SCREAMING_CASE names; any other bare name must be a parameter or a local. Integer
+/// literals are `f64`s (`x * 2`), and plain `f64`s are accepted where an `N` is expected
+/// (`x.maximum(0.0)`).
 ///
 /// Loops run over `lo..hi`. Bounds and array indices are integer literals, loop variables and
 /// `+ - * / %` of them; `i as f64` is a loop variable's value. Outer variables a loop body
-/// assigns carry over to the next iteration, and local arrays `let mut a = [x; LEN];` can be
-/// assigned by element (`a[i] = ..;`). Loops stay loops in the generated code: each forward
-/// iteration saves what its reverse needs, so code size does not grow with the trip count. Integer literals are `f64`s (`x * 2`), and plain `f64`s are accepted where
-/// an `N` is expected (`x.maximum(0.0)`). Parameter names `y`, `res`, `a_*`, and `v`, `a` or
-/// `q` followed by digits are reserved by the generated code, as is the generic parameter name
-/// `R` on a `#[kernels]` `impl`.
+/// assigns carry over to the next iteration (they must be `N`s, and a `let` in the body may
+/// not reuse their name), and local arrays `let mut a = [x; LEN];` can be assigned by element
+/// (`a[i] = ..;`) but not copied. Loops stay loops in the generated code: each forward
+/// iteration saves what its reverse needs, so code size does not grow with the trip count.
+///
+/// Parameter and loop variable names `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`,
+/// `m`, `ac` or `am` followed by digits are reserved by the generated code, as is the generic
+/// parameter name `R` on a `#[kernels]` `impl`.
 ///
 /// The generated code refers to `raads` by the name the calling crate's `Cargo.toml` gives
 /// it, so a renamed dependency (`aad = { package = "raads", .. }`) works.
