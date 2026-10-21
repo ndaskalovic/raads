@@ -58,7 +58,7 @@ impl Heston {
 }
 
 /// One LIBOR market model path and the swaption portfolio's value on it
-/// (src/libor_swaption.hpp, after Giles). p: delta, lambda[80], L0[80].
+/// (src/libor_swaption.hpp, after Giles). p: `delta, lambda[80], L0[80]`.
 #[kernel]
 pub fn libor<N: AdNum>(p: [N; 161], #[data] z: [N; 40]) -> N {
     let delta = p[0];
@@ -270,7 +270,7 @@ fn sabr<L: Lanes<Elem = f64>>(s: &Sabr, want0: &[f64], want_sum: &[f64]) -> (f64
     (primal, grad)
 }
 
-/// delta, lambda[80], L0[80] (src/libor_swaption.hpp, `defaultMarket`).
+/// `delta, lambda[80], L0[80]` (src/libor_swaption.hpp, `defaultMarket`).
 fn libor_params<L: Lanes>() -> [L; 161] {
     std::array::from_fn(|i| {
         L::from(if i == 0 {
