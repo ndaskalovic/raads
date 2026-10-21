@@ -1,0 +1,15 @@
+error: expected the engine module, e.g. `#[kernels(raads_engines::paths)]`
+ --> tests/ui/no_engine.rs:5:1
+  |
+5 | #[kernels]
+  | ^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `kernels` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused import: `AdNum`
+ --> tests/ui/no_engine.rs:1:13
+  |
+1 | use raads::{AdNum, kernels};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

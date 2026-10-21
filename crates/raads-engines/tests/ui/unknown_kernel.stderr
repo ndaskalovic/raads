@@ -1,0 +1,5 @@
+error: `helper` is not a kernel of this engine (expected `setup`, `init`, `step`, `functional`)
+  --> tests/ui/unknown_kernel.rs:24:12
+   |
+24 |     pub fn helper<N: AdNum>(x: N) -> N {
+   |            ^^^^^^

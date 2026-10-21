@@ -1,0 +1,13 @@
+error: parameter name `y` is reserved by the generated code (reserved: `y`, `res`, `a_*`, `v`, `a` or `q` followed by digits)
+ --> tests/ui/reserved_name.rs:4:22
+  |
+4 | fn k<N: AdNum>(x: N, y: N) -> N {
+  |                      ^
+
+warning: unused import: `AdNum`
+ --> tests/ui/reserved_name.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

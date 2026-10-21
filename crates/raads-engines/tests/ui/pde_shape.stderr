@@ -1,0 +1,11 @@
+error: expected `[N; 3]` in `coeffs(#[data] x: N, p: [N; NP]) -> [N; 3]`
+ --> tests/ui/pde_shape.rs:9:58
+  |
+9 |     pub fn coeffs<N: AdNum>(#[data] _x: N, p: [N; 2]) -> [N; 2] {
+  |                                                          ^^^^^^
+
+error: `x` must be `#[data]` in `initial(#[data] x: N, p: [N; NP]) -> N`
+  --> tests/ui/pde_shape.rs:13:33
+   |
+13 |     pub fn initial<N: AdNum>(x: N, _p: [N; 2]) -> N {
+   |                                 ^

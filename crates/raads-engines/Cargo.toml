@@ -1,0 +1,23 @@
+[package]
+name = "raads-engines"
+description = "Monte Carlo path and 1-D PDE engines with compile-time adjoint gradients, built on raads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["autodiff", "aad", "monte-carlo", "pde", "simd"]
+categories = ["mathematics", "science", "simulation"]
+readme = "../../README.md"
+documentation = "https://docs.rs/raads-engines"
+
+[dependencies]
+raads.workspace = true
+
+[dev-dependencies]
+rand = "0.9"
+rand_distr = "0.5"
+trybuild = "1"
+
+[package.metadata.docs.rs]
+rustc-args = ["-C", "target-cpu=x86-64-v3"]

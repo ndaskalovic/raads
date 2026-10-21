@@ -1,0 +1,36 @@
+[package]
+name = "raads-finance"
+description = "Option pricing with compile-time adjoint Greeks on raads-engines: Monte Carlo, finite-difference and surface models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["option-pricing", "greeks", "aad", "finance", "monte-carlo"]
+categories = ["finance", "mathematics"]
+publish = false
+
+[dependencies]
+raads.workspace = true
+raads-engines.workspace = true
+
+[dev-dependencies]
+rand = "0.9"
+rand_distr = "0.5"
+libm = "0.2"
+
+[[bench]]
+name = "mc"
+harness = false
+
+[[bench]]
+name = "fd"
+harness = false
+
+[[bench]]
+name = "surface"
+harness = false
+
+[[bench]]
+name = "second_order"
+harness = false

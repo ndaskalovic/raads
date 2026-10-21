@@ -1,0 +1,5 @@
+error: `z` must be `#[data]` in `step(s: [N; NS], c: [N; NC], #[data] z: [N; NZ]) -> [N; NS]`
+  --> tests/ui/missing_data.rs:16:52
+   |
+16 |     pub fn step<N: AdNum>(s: [N; 1], c: [N; 2], z: [N; 1]) -> [N; 1] {
+   |                                                    ^^^^^^

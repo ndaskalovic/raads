@@ -1,0 +1,12 @@
+[package]
+name = "raads-codegen"
+description = "Graph IR, analyses and straight-line forward/reverse code emitter for raads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["autodiff", "aad", "adjoint", "codegen"]
+categories = ["mathematics"]
+
+[dependencies]

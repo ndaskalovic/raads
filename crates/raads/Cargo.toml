@@ -1,0 +1,24 @@
+[package]
+name = "raads"
+description = "Compile-time adjoint algorithmic differentiation: straight-line SIMD forward, reverse and forward-over-reverse code from one generic function"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["autodiff", "aad", "simd", "derivatives", "adjoint"]
+categories = ["mathematics", "science"]
+readme = "../../README.md"
+documentation = "https://docs.rs/raads"
+
+[dependencies]
+raads-codegen.workspace = true
+raads-macros.workspace = true
+
+[dev-dependencies]
+rand = "0.9"
+trybuild = "1"
+
+[package.metadata.docs.rs]
+# build the docs as users should build the crate on x86_64
+rustc-args = ["-C", "target-cpu=x86-64-v3"]

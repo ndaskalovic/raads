@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/raads", "crates/raads-codegen", "crates/raads-macros", "crates/raads-engines", "crates/raads-finance", "benchmarks"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ndaskalovic/raads"
+authors = ["Nicholas Daskalovic <daskalovic.n@gmail.com>"]
+
+[workspace.dependencies]
+raads-codegen = { path = "crates/raads-codegen", version = "=0.1.0" }
+raads-macros = { path = "crates/raads-macros", version = "=0.1.0" }
+raads = { path = "crates/raads", version = "=0.1.0" }
+raads-engines = { path = "crates/raads-engines", version = "=0.1.0" }
+
+[profile.test]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

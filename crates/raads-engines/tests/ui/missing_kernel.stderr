@@ -1,0 +1,5 @@
+error: missing kernel `functional(s: [N; NS], p: [N; NP], c: [N; NC]) -> N`
+ --> tests/ui/missing_kernel.rs:6:6
+  |
+6 | impl Model {
+  |      ^^^^^

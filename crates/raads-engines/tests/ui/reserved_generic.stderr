@@ -1,0 +1,13 @@
+error: the generic parameter name `R` is reserved by the generated code
+ --> tests/ui/reserved_generic.rs:7:6
+  |
+7 | impl<R> Model<R> {
+  |      ^
+
+warning: unused import: `AdNum`
+ --> tests/ui/reserved_generic.rs:1:13
+  |
+1 | use raads::{AdNum, kernels};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

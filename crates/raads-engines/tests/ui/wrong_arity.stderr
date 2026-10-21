@@ -1,0 +1,5 @@
+error: expected `init(p: [N; NP]) -> [N; NS]`
+  --> tests/ui/wrong_arity.rs:12:26
+   |
+12 |     pub fn init<N: AdNum>(p: [N; 3], #[data] x: N) -> [N; 1] {
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^

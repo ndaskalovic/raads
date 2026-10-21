@@ -1,0 +1,13 @@
+error: `maximum` on a plain f64: write `N::from(k).maximum(..)`
+ --> tests/ui/f64_receiver.rs:7:5
+  |
+7 |     K.maximum(x)
+  |     ^
+
+warning: unused import: `AdNum`
+ --> tests/ui/f64_receiver.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

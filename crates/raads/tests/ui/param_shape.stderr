@@ -1,0 +1,13 @@
+error: kernel parameters and results are `N` or `[N; LEN]`
+ --> tests/ui/param_shape.rs:4:19
+  |
+4 | fn k<N: AdNum>(x: Vec<N>) -> N {
+  |                   ^^^^^^
+
+warning: unused import: `AdNum`
+ --> tests/ui/param_shape.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
