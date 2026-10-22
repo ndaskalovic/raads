@@ -152,12 +152,12 @@ pub fn reads(g: &Graph, need: &[bool]) -> Vec<bool> {
     rd
 }
 
-/// Recomputed by the reverse sweep instead of saved: data, constants and loop indices as
-/// numbers, and with `inputs`
-/// (a `vjp`, which has the inputs) elements of input arrays read in a loop.
+/// Recomputed by the reverse sweep instead of saved: data, constants, plain Rust numbers,
+/// and with `inputs` (a `vjp`, which has the inputs) elements of input arrays read with a
+/// computed index.
 pub fn remat(g: &Graph, i: usize, inputs: bool) -> bool {
     match g.nodes[i].op {
-        Op::Data(_) | Op::Const(_) | Op::Int(_) => true,
+        Op::Data(_) | Op::Const(_) | Op::Num(_) => true,
         Op::Param { data, .. } => data || inputs,
         _ => false,
     }
@@ -239,11 +239,11 @@ impl Analysis {
         (lp + 1..self.ends[lp]).filter(|&i| self.reads[i] && self.parents[i] == lp && !remat(g, i, inputs)).collect()
     }
     /// Values of the loop body `lp` the reverse sweep recomputes at the start of an iteration
-    /// (parameter elements and loop indices; constants are inlined where they are used).
+    /// (parameter elements and plain Rust numbers; constants are inlined where they are used).
     pub fn rematerialised(&self, g: &Graph, lp: usize, inputs: bool) -> Vec<usize> {
         (lp + 1..self.ends[lp])
             .filter(|&i| {
-                self.reads[i] && self.parents[i] == lp && matches!(g.nodes[i].op, Op::Param { .. } | Op::Int(_)) && remat(g, i, inputs)
+                self.reads[i] && self.parents[i] == lp && matches!(g.nodes[i].op, Op::Param { .. } | Op::Num(_)) && remat(g, i, inputs)
             })
             .collect()
     }

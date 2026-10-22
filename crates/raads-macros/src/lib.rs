@@ -72,8 +72,11 @@ pub fn check_kernels(input: TokenStream) -> TokenStream {
 /// literals are `f64`s (`x * 2`), and plain `f64`s are accepted where an `N` is expected
 /// (`x.maximum(0.0)`).
 ///
-/// Loops run over `lo..hi`. Bounds and array indices are integer literals, loop variables and
-/// `+ - * / %` of them; `i as f64` is a loop variable's value. Outer variables a loop body
+/// Loops run over `lo..hi`. Bounds are integer literals, loop variables and `+ - * / %` of
+/// them (the macro sizes the tape from them); `i as f64` is a loop variable's value. Array
+/// indices, integer locals (`let k: usize = ..;`, not reassigned) and numbers may also be plain
+/// Rust of loop variables, integer locals and constants (`IDX[i]`, `knot(h)`, `RATES[i]`): they
+/// are emitted as written and recomputed in the reverse sweep. Outer variables a loop body
 /// assigns carry over to the next iteration (they must be `N`s, and a `let` in the body may
 /// not reuse their name), and local arrays `let mut a = [x; LEN];` can be assigned by element
 /// (`a[i] = ..;`) but not copied. Loops stay loops in the generated code: each forward

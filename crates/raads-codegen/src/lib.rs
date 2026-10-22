@@ -15,7 +15,7 @@ pub mod passes;
 mod unroll;
 
 pub use emit::{Group, Signature};
-pub use int::Int;
+pub use int::{Int, Opaque};
 pub use unroll::unroll;
 
 /// Operand slot that is not used.
@@ -72,8 +72,8 @@ pub enum Op {
     Load(Int),
     /// Element `idx` of the local [`Op::Array`] `a` is set to `b`.
     Store(Int),
-    /// The integer `idx` as an `f64` (a loop index as a number).
-    Int(Int),
+    /// A plain Rust `f64` expression of the loop variables (`i as f64`, `weight(h)`).
+    Num(Opaque<f64>),
     /// Element `idx` of an array parameter.
     Param {
         /// Input (or data) number of element 0.

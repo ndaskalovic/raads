@@ -4,18 +4,20 @@
 
 ![Benchmark chart](ad-benchmarks/chart.png)
 
-The Heston MC, SABR calibration and LIBOR swaption workloads of [auto-differentiation/ad-benchmarks](https://github.com/auto-differentiation/ad-benchmarks), the suite in [XAD's README](https://github.com/auto-differentiation/xad#benchmarks), with raads added. Gradient time; Primal is the same workload in plain C++ doubles (the dashed line).
+The Heston MC, SABR calibration, XVA and LIBOR swaption workloads of [auto-differentiation/ad-benchmarks](https://github.com/auto-differentiation/ad-benchmarks), the suite in [XAD's README](https://github.com/auto-differentiation/xad#benchmarks), with raads added. Gradient time; Primal is the same workload in plain C++ doubles (the dashed line).
 
 | # | Benchmark | Sensis | Primal | FD | XAD | Adept | autodiff | raads | raads SIMD |
 |---|---|:-:|--:|--:|--:|--:|--:|--:|--:|
-| 1 | Heston MC | 8 | 5.19 ms | 46.6 ms | 45.4 ms | 68.6 ms | DNF | 17.1 ms | **2.56 ms** |
-| 2 | SABR Calib | 15 | 0.848 ms | 13.6 ms | 6.79 ms | 13.8 ms | 17.5 ms | 0.926 ms | **0.772 ms** |
-| 4 | LIBOR Swaption | 161 | 50.2 ms | 7.57 s | 841 ms | 924 ms | DNF | 127 ms | **55.6 ms** |
+| 1 | Heston MC | 8 | 5.16 ms | 46.5 ms | 44.9 ms | 68.6 ms | DNF | 17.0 ms | **2.54 ms** |
+| 2 | SABR Calib | 15 | 0.851 ms | 13.5 ms | 6.81 ms | 13.6 ms | 17.3 ms | 0.930 ms | **0.777 ms** |
+| 3 | XVA CVA | 40 | 237 ms | 9.74 s | 1.62 s | 5.26 s | DNF | 877 ms | **123 ms** |
+| 4 | LIBOR Swaption | 161 | 49.9 ms | 7.52 s | 830 ms | 915 ms | DNF | 129 ms | **55.3 ms** |
 
-- Same inputs, sizes and timing as the suite: its own code generates the random numbers and market data ([`ad-benchmarks/reference.cpp`](ad-benchmarks/reference.cpp)), median of 10 runs after 3 warm-ups, f64, single core. raads's values and gradients match XAD's to 1e-9.
-- raads runs the suite's kernels ported line by line ([`src/bin/adbench.rs`](src/bin/adbench.rs)): Heston as a path model, the SABR objective as a kernel over strikes, LIBOR as one kernel per path with its loops. raads: 1 lane; raads SIMD: 8 lanes (Heston), 4 (SABR, LIBOR).
+- Same inputs, sizes and timing as the suite: its own code generates the random numbers and market data ([`ad-benchmarks/reference.cpp`](ad-benchmarks/reference.cpp)), median of 10 runs after 3 warm-ups, f64, single core. raads's values and gradients match XAD's to 1e-9, except two XVA gradients (below).
+- raads runs the suite's kernels ported line by line ([`src/bin/adbench.rs`](src/bin/adbench.rs)): Heston as a path model, the SABR objective as a kernel over strikes, LIBOR and XVA as one kernel per path with their loops, XVA's curve lookups (interval and weight of a time) in plain Rust. raads: 1 lane; raads SIMD: 8 lanes (Heston), 4 (SABR, LIBOR), 16 (XVA).
+- XVA's derivatives w.r.t. `rates[10]` and `vols[0]` are left out of the check: they are below f64 resolution. A few paths reach CVAs up to 4e44 (the mean is 3e41) and dominate these two means. There raads's reverse mode, forward mode (`Dual`) and XAD disagree with each other by 10–50%, and on one such path 80-digit arithmetic gives a `rates[10]` derivative five orders of magnitude smaller than f64 does.
 - The suite's LIBOR timings include drawing the normals inside the timed loop; raads reads them pre-drawn. Drawing them costs 5.1 ms, under 1% of XAD's time.
-- Apple M5, Apple clang 17. Differences from the suite's published run (Xeon, GCC 13, `-O3 -mavx2 -mfma`): `-mcpu=native` on ARM; CppAD left out (its build needs pkg-config); XAD-Codegen is commercial. XVA is not ported yet: it needs array indices computed from times.
+- Apple M5, Apple clang 17. Differences from the suite's published run (Xeon, GCC 13, `-O3 -mavx2 -mfma`): `-mcpu=native` on ARM; CppAD left out (its build needs pkg-config); XAD-Codegen is commercial.
 - Versions: ad-benchmarks c8439f9, XAD 9c33936, Adept d0a7751, autodiff b0a4fef.
 
 Reproduce, from the repository root:

@@ -214,11 +214,16 @@ pub fn function(g: &Graph, sig: &Signature, kind: Kind, vis: &str, name: &str, k
                     false => writeln!(s, "    let v{r}: R::Lanes = res[{k}].value();").unwrap(),
                 }
             }
+            // rematerialised top-level values (constants are inlined where they are used)
             for (i, n) in g.nodes.iter().enumerate() {
-                if let Op::Data(j) = n.op
-                    && an.reads[i]
-                {
-                    writeln!(s, "    let v{i}: R::Lanes = {}.value();", sig.slot(j, true).0).unwrap();
+                if !an.reads[i] || an.parents[i] != NONE || !crate::passes::remat(g, i, false) {
+                    continue;
+                }
+                match &n.op {
+                    Op::Data(j) => writeln!(s, "    let v{i}: R::Lanes = {}.value();", sig.slot(*j, true).0).unwrap(),
+                    Op::Param { first, data, idx, .. } => writeln!(s, "    {}", e.load_param(i, *first, *data, idx)).unwrap(),
+                    Op::Num(x) => writeln!(s, "    {}", Emitter::load_num(i, x)).unwrap(),
+                    _ => {}
                 }
             }
             e.reverse(&mut s, Tape::Res);
@@ -380,16 +385,16 @@ impl Emitter<'_> {
                 Op::Load(idx) => writeln!(s, "    let v{i}: {} = m{}[{idx}];", self.ty(i), n.a).unwrap(),
                 Op::Store(idx) => writeln!(s, "    m{}[{idx}] = {};", n.a, self.as_ty(n.a, n.b)).unwrap(),
                 Op::Param { first, data, idx, .. } => writeln!(s, "    {}", self.load_param(i, *first, *data, idx)).unwrap(),
-                Op::Int(idx) => writeln!(s, "    {}", Self::load_int(i, idx)).unwrap(),
+                Op::Num(x) => writeln!(s, "    {}", Self::load_num(i, x)).unwrap(),
                 _ if self.act(i) => writeln!(s, "    let v{i}: R = {};", self.active_value(n)).unwrap(),
                 _ => writeln!(s, "    let v{i}: R::Lanes = {};", self.passive_value(n)).unwrap(),
             }
         }
     }
 
-    /// `let v<i> = ..;` for an integer as a number.
-    fn load_int(i: usize, idx: &crate::Int) -> String {
-        format!("let v{i}: R::Lanes = <R::Lanes as ::core::convert::From<f64>>::from({idx} as f64);")
+    /// `let v<i> = ..;` for a plain Rust number.
+    fn load_num(i: usize, x: &crate::Opaque<f64>) -> String {
+        format!("let v{i}: R::Lanes = <R::Lanes as ::core::convert::From<f64>>::from({});", x.src)
     }
     /// `let v<i> = ..;` for an element of an array parameter.
     fn load_param(&self, i: usize, first: usize, data: bool, idx: &crate::Int) -> String {
@@ -522,7 +527,7 @@ impl Emitter<'_> {
         match n.op {
             Op::SelGt => vec![n.c, n.d],
             Op::Next | Op::Store(_) => vec![n.b],
-            Op::Out | Op::Load(_) | Op::Loop(..) | Op::End | Op::Param { .. } | Op::Int(_) => vec![],
+            Op::Out | Op::Load(_) | Op::Loop(..) | Op::End | Op::Param { .. } | Op::Num(_) => vec![],
             _ => n.args().collect(),
         }
     }
@@ -576,7 +581,7 @@ impl Emitter<'_> {
                     for r in self.an.rematerialised(g, lp, tape == Tape::Vec) {
                         match &g.nodes[r].op {
                             Op::Param { first, data, idx, .. } => writeln!(s, "    {}", self.load_param(r, *first, *data, idx)).unwrap(),
-                            Op::Int(idx) => writeln!(s, "    {}", Self::load_int(r, idx)).unwrap(),
+                            Op::Num(x) => writeln!(s, "    {}", Self::load_num(r, x)).unwrap(),
                             _ => unreachable!(),
                         }
                     }

@@ -1,9 +1,9 @@
-//! raads on the Heston MC, SABR calibration and LIBOR swaption workloads of auto-differentiation/ad-benchmarks
+//! raads on the Heston MC, SABR calibration, LIBOR swaption and XVA workloads of auto-differentiation/ad-benchmarks
 //! (the suite in XAD's README), with that suite's inputs, sizes and timing: median of 10 runs
 //! after 3 warm-ups, f64. Inputs and XAD's results come from `ad-benchmarks/reference.cpp`
 //! (target/adbench.bin, target/adbench_reference.txt); results are checked against XAD first.
 //! Prints every lane width and writes the suite's CSV rows to target/adbench_raads.csv: `raads`
-//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR and LIBOR). Run by
+//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR and LIBOR, 16 for XVA). Run by
 //! `ad-benchmarks/run.sh`.
 
 use raads::lanes::{F64x2, F64x4, F64x8, F64x16};
@@ -20,6 +20,15 @@ const ITERS: usize = 500;
 /// LIBOR rates (src/libor_swaption.hpp: 80) and time steps (normals per path).
 const RATES: usize = 80;
 const LSTEPS: usize = 40;
+/// Swaption maturities (time steps) and swap rates (src/libor_swaption.hpp, `defaultPortfolio`).
+const MATURITIES: [usize; 15] = [4, 4, 4, 8, 8, 8, 20, 20, 20, 28, 28, 28, 40, 40, 40];
+const SWAPRATES: [f64; 15] = [0.045, 0.05, 0.055, 0.045, 0.05, 0.055, 0.045, 0.05, 0.055, 0.045, 0.05, 0.055, 0.045, 0.05, 0.055];
+/// XVA: yield curve and hazard rate tenors in years, time step and swap notional (src/xva.hpp).
+const XVA_RATE_TENORS: [f64; 20] =
+    [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 15.0, 17.0, 20.0, 22.0, 25.0, 27.0, 28.0, 30.0];
+const XVA_HAZARD_TENORS: [f64; 10] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+const XVA_DT: f64 = 0.5;
+const XVA_NOTIONAL: f64 = 1e6;
 /// S0, K, T, r, v0, kappa, theta, xi (src/heston.hpp)
 const HESTON: [f64; 8] = [100.0, 105.0, 1.0, 0.05, 0.04, 2.0, 0.04, 0.3];
 
@@ -87,28 +96,94 @@ pub fn libor<N: AdNum>(p: [N; 161], #[data] z: [N; 40]) -> N {
         bs[n] = b;
         ss[n] = s;
     }
-    // receiver swaptions: maturities 4, 8, 20, 28, 40 (index 39 + maturity), swap rates
-    // 4.5%, 5%, 5.5%
+    // receiver swaptions; a maturity of m steps reads index 39 + m
     let mut v = N::from(0.0);
-    v = v - (bs[43] + ss[43] * 0.045 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[43] + ss[43] * 0.05 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[43] + ss[43] * 0.055 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[47] + ss[47] * 0.045 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[47] + ss[47] * 0.05 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[47] + ss[47] * 0.055 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[59] + ss[59] * 0.045 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[59] + ss[59] * 0.05 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[59] + ss[59] * 0.055 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[67] + ss[67] * 0.045 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[67] + ss[67] * 0.05 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[67] + ss[67] * 0.055 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[79] + ss[79] * 0.045 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[79] + ss[79] * 0.05 - 1.0).minimum(0.0) * 100.0;
-    v = v - (bs[79] + ss[79] * 0.055 - 1.0).minimum(0.0) * 100.0;
+    for i in 0..15 {
+        let m: usize = MATURITIES[i] + 39;
+        v = v - (bs[m] + ss[m] * SWAPRATES[i] - 1.0).minimum(0.0) * 100.0;
+    }
     for n in 0..40 {
         v = v / (delta * l[n] + 1.0);
     }
     v
+}
+
+/// Interval `k` of `tenors` holding time `t`, as src/xva.hpp interpolates a curve `x`:
+/// `x[k] * (1 - w) + x[k + 1] * w` with `w = weight(tenors, t)`, flat outside the tenors.
+fn knot(tenors: &[f64], t: f64) -> usize {
+    let n = tenors.len();
+    if t <= tenors[0] {
+        0
+    } else if t >= tenors[n - 1] {
+        n - 2
+    } else {
+        (0..n - 1).find(|&i| t < tenors[i + 1]).unwrap()
+    }
+}
+
+/// Interpolation weight of `tenors[knot(tenors, t) + 1]` at time `t`.
+fn weight(tenors: &[f64], t: f64) -> f64 {
+    let n = tenors.len();
+    if t <= tenors[0] {
+        0.0
+    } else if t >= tenors[n - 1] {
+        1.0
+    } else {
+        let k = knot(tenors, t);
+        (t - tenors[k]) / (tenors[k + 1] - tenors[k])
+    }
+}
+
+/// CVA of a portfolio of 15 swaps on one path (src/xva.hpp, `xva_compute_cva`): every
+/// half year the curve takes a shock, the swaps are priced on it and the positive exposure
+/// is weighted by the default probability and the discount factor. p: `rates[20],
+/// hazard[10], vols[10]`; z: the path's normals (the first 20 are used).
+#[kernel]
+pub fn xva<N: AdNum>(p: [N; 40], #[data] z: [N; 40]) -> N {
+    let mut d = [N::from(0.0); 20];
+    for i in 0..20 {
+        d[i] = p[i];
+    }
+    let mut cva = N::from(0.0);
+    for b in 0..20 {
+        let t = (b + 1) as f64 * XVA_DT;
+        for i in 0..20 {
+            d[i] = d[i] + p[30 + i % 10] * XVA_DT.sqrt() * z[i % 40];
+        }
+        // swap s pays every half year until 10 years: 19 - b payments left
+        let mut pv = N::from(0.0);
+        for s in 0..15 {
+            let mut fixed = N::from(0.0);
+            let mut float = N::from(0.0);
+            for i in 0..19 - b {
+                let t1 = t + (i + 1) as f64 * XVA_DT;
+                let k1: usize = knot(&XVA_RATE_TENORS, t1);
+                let w1 = weight(&XVA_RATE_TENORS, t1);
+                let df = (-(d[k1] * (1.0 - w1) + d[k1 + 1] * w1) * t1).exp();
+                fixed = fixed + XVA_NOTIONAL * (0.02 + 0.001 * s as f64) * XVA_DT * df;
+                let t0 = t + i as f64 * XVA_DT;
+                let k0: usize = knot(&XVA_RATE_TENORS, t0);
+                let w0 = weight(&XVA_RATE_TENORS, t0);
+                let df_prev = (-(d[k0] * (1.0 - w0) + d[k0 + 1] * w0) * t0).exp();
+                let fwd = (df_prev / df - 1.0) / XVA_DT;
+                float = float + XVA_NOTIONAL * XVA_DT * fwd * df;
+            }
+            // even swaps pay fixed
+            pv = pv + (float - fixed) * (1.0 - 2.0 * (s % 2) as f64);
+        }
+        let exposure = pv.relu();
+        let kp: usize = knot(&XVA_HAZARD_TENORS, t - XVA_DT);
+        let wp = weight(&XVA_HAZARD_TENORS, t - XVA_DT);
+        let surv_prev = (-(p[20 + kp] * (1.0 - wp) + p[21 + kp] * wp) * (t - XVA_DT)).exp();
+        let kh: usize = knot(&XVA_HAZARD_TENORS, t);
+        let wh = weight(&XVA_HAZARD_TENORS, t);
+        let surv = (-(p[20 + kh] * (1.0 - wh) + p[21 + kh] * wh) * t).exp();
+        let k: usize = knot(&XVA_RATE_TENORS, t);
+        let w = weight(&XVA_RATE_TENORS, t);
+        let df = (-(p[k] * (1.0 - w) + p[k + 1] * w) * t).exp();
+        cva = cva + exposure * (surv_prev - surv) * df;
+    }
+    cva
 }
 
 /// Squared error of the Hagan 2002 vol against the market vol at one strike (src/sabr.hpp,
@@ -283,13 +358,13 @@ fn libor_params<L: Lanes>() -> [L; 161] {
     })
 }
 
-/// Normals per block of W paths: step `k`, lane `l`.
-fn libor_normals<L: Lanes>(raw: &[f64]) -> Vec<[L; LSTEPS]> {
-    raw.chunks(LSTEPS * L::W).map(|block| std::array::from_fn(|k| L::from_fn(|l| block[l * LSTEPS + k]))).collect()
+/// Normals per block of W paths of K draws: draw `k`, lane `l`.
+fn path_normals<L: Lanes, const K: usize>(raw: &[f64]) -> Vec<[L; K]> {
+    raw.chunks(K * L::W).map(|block| std::array::from_fn(|k| L::from_fn(|l| block[l * K + k]))).collect()
 }
 
 fn libor_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
-    let z = libor_normals::<L>(raw);
+    let z = path_normals::<L, LSTEPS>(raw);
     let p = libor_params::<L>();
     let grad = |p: &[L; 161]| {
         let mut g = [L::from(0.0); 161];
@@ -313,6 +388,44 @@ fn libor_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
     (primal, grad)
 }
 
+/// `rates[20], hazard[10], vols[10]` (src/xva.hpp, `XVAMarketData`).
+fn xva_params<L: Lanes>() -> [L; 40] {
+    std::array::from_fn(|i| {
+        L::from(match i {
+            0..20 => 0.02 + 0.001 * i as f64,
+            20..30 => 0.01 + 0.001 * (i - 20) as f64,
+            _ => 0.15 + 0.01 * (i - 30) as f64,
+        })
+    })
+}
+
+fn xva_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
+    let z = path_normals::<L, 40>(raw);
+    let p = xva_params::<L>();
+    let grad = |p: &[L; 40]| {
+        let mut g = [L::from(0.0); 40];
+        let mut v = L::from(0.0);
+        for zb in &z {
+            v += xva::vjp(p, zb, L::from(1.0), &mut g);
+        }
+        (v, g)
+    };
+    let (v, g) = grad(&p);
+    let got: Vec<f64> = std::iter::once(v).chain(g).map(|x| x.sum() / PATHS as f64).collect();
+    // d/d rates[10] and d/d vols[0] are below f64 resolution (benchmarks/README.md): left out
+    let keep = |v: &[f64]| -> Vec<f64> { v.iter().enumerate().filter(|(i, _)| ![11, 31].contains(i)).map(|(_, &x)| x).collect() };
+    check(&format!("xva W={} (without rates[10], vols[0])", L::W), &keep(&got), &keep(want));
+    let primal = median_ms(3, 10, || {
+        let p = black_box(&p);
+        black_box(z.iter().fold(L::from(0.0), |v, zb| v + xva::eval(p, zb)));
+    });
+    let grad = median_ms(3, 10, || {
+        black_box(grad(black_box(&p)));
+    });
+    println!("raads xva W={:2}: primal {primal:.3} ms, gradient {grad:.3} ms", L::W);
+    (primal, grad)
+}
+
 fn main() {
     let bytes = std::fs::read("target/adbench.bin").expect("run ad-benchmarks/reference.cpp first (benchmarks/ad-benchmarks/run.sh)");
     let all: Vec<f64> = bytes.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b)).collect();
@@ -330,6 +443,7 @@ fn main() {
     s.init = std::array::from_fn(|_| it.next().unwrap());
     s.dp = (0..ITERS).map(|_| std::array::from_fn(|_| it.next().unwrap())).collect();
     let lz: Vec<f64> = it.by_ref().take(PATHS * LSTEPS).collect();
+    let xz: Vec<f64> = it.by_ref().take(PATHS * 40).collect();
     assert!(it.next().is_none(), "unexpected trailing data");
 
     let refs = std::fs::read_to_string("target/adbench_reference.txt").expect("XAD reference values");
@@ -352,6 +466,12 @@ fn main() {
     libor_bench::<F64x2>(&lz, &l);
     let l4 = libor_bench::<F64x4>(&lz, &l);
     libor_bench::<F64x8>(&lz, &l);
+    let x = line("xva");
+    let x1 = xva_bench::<f64>(&xz, &x);
+    xva_bench::<F64x2>(&xz, &x);
+    xva_bench::<F64x4>(&xz, &x);
+    xva_bench::<F64x8>(&xz, &x);
+    let x16 = xva_bench::<F64x16>(&xz, &x);
     let rows: String = [
         ("raads", "HestonMC", h1),
         ("raads SIMD", "HestonMC", h8),
@@ -359,6 +479,8 @@ fn main() {
         ("raads SIMD", "SABRCalib", s4),
         ("raads", "LiborSwaption", l1),
         ("raads SIMD", "LiborSwaption", l4),
+        ("raads", "XVA-CVA", x1),
+        ("raads SIMD", "XVA-CVA", x16),
     ]
     .iter()
     .map(|(lib, bench, (primal, grad))| format!("{lib},{bench},{primal:.6},{grad:.6}\n"))

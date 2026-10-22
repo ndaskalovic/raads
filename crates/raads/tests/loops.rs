@@ -65,6 +65,42 @@ fn misc<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 3] {
     a
 }
 
+const LAST: usize = 4;
+const IDX: [usize; 4] = [2, 0, 3, 1];
+const W: [f64; 4] = [0.5, -1.0, 2.0, 0.25];
+
+fn pick(h: usize) -> usize {
+    h / 2
+}
+
+fn weight(h: usize) -> f64 {
+    h as f64 * 0.1 + 0.3
+}
+
+fn damp(w: f64) -> f64 {
+    0.1 / (1.0 + w)
+}
+
+/// Plain Rust indices and numbers: const arrays, functions, integer locals (one used in an
+/// inner loop), a plain f64 local passed to a function, and computed indices at the top level
+/// (an input and a data element).
+#[kernel]
+fn plain<N: AdNum>(x: [N; 5], #[data] d: [N; 4]) -> [N; 2] {
+    let last: usize = LAST;
+    let mut a = [x[0]; 4];
+    let mut s = x[last] * d[IDX[0]];
+    for i in 0..4 {
+        let k: usize = IDX[i];
+        let w = weight(i + 1);
+        a[k] = a[k] * x[pick(i + 2)] + w * W[i] * d[k];
+        s = s + (1.0 - w) * a[IDX[3 - i]] + (k as f64) * x[k + 1];
+        for j in 0..i {
+            s = s * (W[j] * weight(k + j) * damp(w)).exp() + x[pick(j + k)] * d[(j + k) % 4];
+        }
+    }
+    [s, a[pick(LAST - 1)]]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -133,6 +169,11 @@ fn carried_sum() {
 #[test]
 fn triangular_nest() {
     check!(triangle, [0.05, 0.05, 0.06, 0.04, 0.055, 0.2, 0.25, 0.18], [0.3, -1.2, 0.7], 2);
+}
+
+#[test]
+fn plain_rust() {
+    check!(plain, [0.4, 0.9, 1.3, -0.2, 0.7], [0.5, -0.8, 1.1, 0.3], 2);
 }
 
 #[test]

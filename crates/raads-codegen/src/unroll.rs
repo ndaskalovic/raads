@@ -64,8 +64,8 @@ impl Unroll<'_> {
                     let k = idx.eval(vars).expect("index");
                     self.arrays[n.a][k] = self.map[n.b];
                 }
-                Op::Int(idx) => {
-                    let k = idx.eval(vars).expect("index") as f64;
+                Op::Num(x) => {
+                    let k = x.call(vars).expect("number");
                     self.map[i] = self.out.push(Op::Const(crate::f64_literal(k)), NONE, NONE, NONE, NONE);
                 }
                 Op::Param { first, len, data, idx } => {

@@ -1,0 +1,13 @@
+error: loop bounds are integer literals, loop variables and `+ - * / %` of them (the macro sizes the tape from them)
+ --> tests/ui/plain_loop_bound.rs:8:14
+  |
+8 |     for i in 0..LEN {
+  |              ^^^^^^
+
+warning: unused import: `AdNum`
+ --> tests/ui/plain_loop_bound.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
