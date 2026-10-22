@@ -9,11 +9,13 @@
 //! Loops are not unrolled: a `for` loop becomes a [`Op::Loop`] marker, its body (traced
 //! once, with the loop variable symbolic), an [`Op::End`], and a carried value
 //! ([`Op::Phi`], [`Op::Next`], [`Op::Out`]) for every outer variable the body assigns.
-//! Arrays written with a loop-dependent index are local arrays (`let mut a = [x; LEN]`) or
+//! Arrays written with a loop-dependent index are local arrays (`let mut a = [x; 8]`) or
 //! array parameters, read and written through [`Op::Load`], [`Op::Store`], [`Op::Param`].
 //! Indices the macro cannot evaluate (`MATURITIES[i]`, `interval(h)`) and plain `f64`
 //! expressions of loop variables (`i as f64`, `weight(h)`) stay Rust source
-//! ([`Opaque`]); `let k: usize = ..;` names an index.
+//! ([`Opaque`]). A `let` of one (`let k: usize = ..;`, `let w = weight(h);`) becomes a local
+//! of the generated code ([`Op::LetInt`], [`Op::LetNum`]), computed once where it is defined
+//! and read by name.
 //!
 //! It also returns the function body rewritten so it compiles for any `N: AdNum`
 //! (`2 * x` becomes `x.rmul(2f64)`, `x.maximum(0.0)` becomes `x.maximum(N::from(0.0))`),
@@ -98,8 +100,11 @@ pub struct Builder {
     elems: HashMap<(usize, String), usize>,
     /// Variables the innermost loop carries to its next iteration.
     carried: Vec<String>,
-    /// Integer locals (`let k: usize = ..;`), substituted where they are used.
+    /// Integer locals (`let k: usize = ..;`): a literal, or the variable of their
+    /// [`Op::LetInt`].
     ilocals: HashMap<String, Int>,
+    /// Variables of [`Op::LetNum`]s, which are `f64`s (other variables are `usize`).
+    num_lets: HashSet<String>,
     /// The kernel's number type parameter and the path of `raads`.
     n: Ident,
     krate: TokenStream,
@@ -121,6 +126,7 @@ impl Builder {
             elems: HashMap::new(),
             carried: Vec::new(),
             ilocals: HashMap::new(),
+            num_lets: HashSet::new(),
             n: n.clone(),
             krate: krate.clone(),
         };
@@ -173,10 +179,26 @@ impl Builder {
         if self.ints.contains(&name) {
             return err(span, &format!("`{name}` shadows a loop variable"));
         }
+        let v = self.local(v);
         self.params.remove(&name);
         self.ilocals.remove(&name);
         self.env.insert(name, v);
         Ok(())
+    }
+
+    /// `v` with each plain `f64` that reads loop variables replaced by a local of the
+    /// generated code, computed here: where the value is defined, not where it is used.
+    fn local(&mut self, v: Val) -> Val {
+        match v {
+            Val::F(F::Expr(t, vars)) if !vars.is_empty() => {
+                let j = self.push(Op::LetNum(Opaque { src: t.to_string(), vars, eval: None }), NONE, NONE, NONE, NONE);
+                let name = format!("p{j}");
+                self.num_lets.insert(name.clone());
+                Val::F(F::Expr(name.parse().unwrap(), vec![name]))
+            }
+            Val::Arr(vs) => Val::Arr(vs.into_iter().map(|v| self.local(v)).collect()),
+            v => v,
+        }
     }
 
     /// Rewritten source `t` of `v` where an `N` is expected: plain `f64`s become `N::from(t)`
@@ -229,7 +251,10 @@ impl Builder {
                             &format!("`{name}` is carried to the next iteration: a `let` here would hide it, use another name"),
                         );
                     }
-                    let k = self.int(&init.expr)?;
+                    let k = match self.int(&init.expr)? {
+                        Int::Lit(k) => Int::Lit(k),
+                        k => Int::Var(format!("p{}", self.push(Op::LetInt(k), NONE, NONE, NONE, NONE))),
+                    };
                     self.env.remove(&name);
                     self.params.remove(&name);
                     self.ilocals.insert(name, k);
@@ -252,7 +277,7 @@ impl Builder {
                     let Expr::Index(ix) = &*a.left else { unreachable!() };
                     let name = ident_of(&ix.expr)?;
                     let Some(&Val::Mem(m)) = self.env.get(&name) else {
-                        return err(ix.expr.span(), "only local arrays (`let mut a = [x; LEN];`) can be assigned by element");
+                        return err(ix.expr.span(), "only local arrays (`let mut a = [x; 8];`) can be assigned by element");
                     };
                     let idx = self.int(&ix.index)?;
                     let (v, e) = self.expr(&a.right)?;
@@ -303,7 +328,8 @@ impl Builder {
             return err(r.span(), "a kernel loop runs over a range `lo..hi`");
         };
         let (lo, hi) = (self.int(start)?, self.int(end)?);
-        if lo.has_opaque() || hi.has_opaque() {
+        let loop_vars_only = |b: &Int| !b.has_opaque() && b.vars().iter().all(|v| self.ints.contains(v));
+        if !loop_vars_only(&lo) || !loop_vars_only(&hi) {
             return err(
                 r.span(),
                 "loop bounds are integer literals, loop variables and `+ - * / %` of them (the macro sizes the tape from them)",
@@ -382,7 +408,7 @@ impl Builder {
 
     /// A plain Rust expression (`MATURITIES[i]`, `weight(h)`), which the macro does not
     /// interpret: its source for the generated code, with integer and plain `f64` locals
-    /// substituted, and the loop variables it reads.
+    /// replaced by their variables, and the variables it reads.
     fn plain(&self, e: &impl ToTokens) -> Result<(TokenStream, Vec<String>)> {
         let mut vars = Vec::new();
         let t = self.plain_tokens(e.to_token_stream(), &mut vars)?;
@@ -512,10 +538,7 @@ impl Builder {
                 let v = match (v, idx.constant()) {
                     (Val::Arr(vs), Some(k)) => vs.get(k).cloned().ok_or_else(|| Error::new(ix.index.span(), "index out of bounds"))?,
                     (Val::Arr(_), None) => {
-                        return err(
-                            ix.index.span(),
-                            "an index that depends on a loop variable needs an array parameter or a local array (`let mut a = [x; LEN];`)",
-                        );
+                        return err(ix.index.span(), "a computed index needs an array parameter or a local array (`let mut a = [x; 8];`)");
                     }
                     (Val::Mem(m), _) => {
                         self.check_index(&idx, m, ix.index.span())?;
@@ -863,7 +886,7 @@ impl Builder {
                 Op::SelGt => quote!(SelGt),
                 Op::Stop => quote!(Stop),
                 Op::Loop(var, lo, hi) => {
-                    let (lo, hi) = (int_code(lo, krate), int_code(hi, krate));
+                    let (lo, hi) = (self.int_code(lo), self.int_code(hi));
                     quote!(Loop(#var.to_string(), #lo, #hi))
                 }
                 Op::End => quote!(End),
@@ -872,20 +895,28 @@ impl Builder {
                 Op::Out => quote!(Out),
                 Op::Array(len) => quote!(Array(#len)),
                 Op::Load(idx) => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Load(#idx))
                 }
                 Op::Store(idx) => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Store(#idx))
                 }
                 Op::Param { first, len, data, idx } => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Param { first: #first, len: #len, data: #data, idx: #idx })
                 }
                 Op::Num(x) => {
-                    let x = opaque_code(x, quote!(f64), krate);
+                    let x = self.opaque_code(x, quote!(f64));
                     quote!(Num(#x))
+                }
+                Op::LetInt(idx) => {
+                    let idx = self.int_code(idx);
+                    quote!(LetInt(#idx))
+                }
+                Op::LetNum(x) => {
+                    let x = self.opaque_code(x, quote!(f64));
+                    quote!(LetNum(#x))
                 }
             };
             quote!(g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
@@ -898,6 +929,44 @@ impl Builder {
             g
         }
     }
+
+    /// Code that builds `i`.
+    fn int_code(&self, i: &Int) -> TokenStream {
+        let krate = &self.krate;
+        match i {
+            Int::Lit(k) => quote!(#krate::__private::codegen::Int::Lit(#k)),
+            Int::Var(v) => quote!(#krate::__private::codegen::Int::Var(#v.to_string())),
+            Int::Bin(a, op, b) => {
+                let (a, b) = (self.int_code(a), self.int_code(b));
+                quote!(#krate::__private::codegen::Int::Bin(Box::new(#a), #op, Box::new(#b)))
+            }
+            Int::Opaque(x) => {
+                let x = self.opaque_code(x, quote!(usize));
+                quote!(#krate::__private::codegen::Int::Opaque(#x))
+            }
+        }
+    }
+
+    /// Code that builds `x`, with a function that evaluates it from its variables.
+    fn opaque_code<T>(&self, x: &Opaque<T>, ty: TokenStream) -> TokenStream {
+        let krate = &self.krate;
+        let (src, vars) = (&x.src, &x.vars);
+        let t: TokenStream = src.parse().unwrap();
+        let binds = vars.iter().enumerate().map(|(k, v)| {
+            let id = Ident::new(v, Span::call_site());
+            match self.num_lets.contains(v) {
+                true => quote!(#[allow(unused_variables)] let #id: f64 = __raads_vars[#k];),
+                false => quote!(#[allow(unused_variables)] let #id: usize = __raads_vars[#k] as usize;),
+            }
+        });
+        quote! {
+            #krate::__private::codegen::Opaque {
+                src: #src.to_string(),
+                vars: vec![#(#vars.to_string()),*],
+                eval: Some(|__raads_vars: &[f64]| -> #ty { #(#binds)* #t }),
+            }
+        }
+    }
 }
 
 /// `v` is or contains a local array.
@@ -906,39 +975,6 @@ fn has_mem(v: &Val) -> bool {
         Val::Mem(_) => true,
         Val::Arr(vs) => vs.iter().any(has_mem),
         _ => false,
-    }
-}
-
-/// Code that builds `i`.
-fn int_code(i: &Int, krate: &TokenStream) -> TokenStream {
-    match i {
-        Int::Lit(k) => quote!(#krate::__private::codegen::Int::Lit(#k)),
-        Int::Var(v) => quote!(#krate::__private::codegen::Int::Var(#v.to_string())),
-        Int::Bin(a, op, b) => {
-            let (a, b) = (int_code(a, krate), int_code(b, krate));
-            quote!(#krate::__private::codegen::Int::Bin(Box::new(#a), #op, Box::new(#b)))
-        }
-        Int::Opaque(x) => {
-            let x = opaque_code(x, quote!(usize), krate);
-            quote!(#krate::__private::codegen::Int::Opaque(#x))
-        }
-    }
-}
-
-/// Code that builds `x`, with a function that evaluates it from its loop variables.
-fn opaque_code<T>(x: &Opaque<T>, ty: TokenStream, krate: &TokenStream) -> TokenStream {
-    let (src, vars) = (&x.src, &x.vars);
-    let t: TokenStream = src.parse().unwrap();
-    let binds = vars.iter().enumerate().map(|(k, v)| {
-        let id = Ident::new(v, Span::call_site());
-        quote!(#[allow(unused_variables)] let #id: usize = __raads_vars[#k];)
-    });
-    quote! {
-        #krate::__private::codegen::Opaque {
-            src: #src.to_string(),
-            vars: vec![#(#vars.to_string()),*],
-            eval: Some(|__raads_vars: &[usize]| -> #ty { #(#binds)* #t }),
-        }
     }
 }
 

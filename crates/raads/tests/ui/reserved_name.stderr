@@ -1,4 +1,4 @@
-error: parameter name `y` is reserved by the generated code (reserved: `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`, `m`, `ac` or `am` followed by digits)
+error: parameter name `y` is reserved by the generated code (reserved: `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`, `m`, `p`, `ac` or `am` followed by digits)
  --> tests/ui/reserved_name.rs:4:22
   |
 4 | fn k<N: AdNum>(x: N, y: N) -> N {

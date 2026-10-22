@@ -101,6 +101,50 @@ fn plain<N: AdNum>(x: [N; 5], #[data] d: [N; 4]) -> [N; 2] {
     [s, a[pick(LAST - 1)]]
 }
 
+/// An inner loop variable that shadows an outer one: plain locals keep the outer value.
+#[kernel]
+fn shadowed<N: AdNum>(x: [N; 4], #[data] d: [N; 1]) -> [N; 1] {
+    let mut s = N::from(0.0);
+    for i in 0..2 {
+        let k: usize = i;
+        let w = i as f64;
+        for i in 0..2 {
+            s = s + w * x[i] + x[k + 2] * (i as f64 + 1.0);
+        }
+    }
+    [s * d[0]]
+}
+
+/// A chain of plain locals, each read several times: each is computed once, so the
+/// expansion grows linearly with the chain.
+#[kernel]
+fn locals<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let mut s = x[0];
+    for i in 0..3 {
+        let a0 = i as f64 * 0.25 + 1.0;
+        let a1 = a0 * a0 - a0 * 0.5;
+        let a2 = a1 * a1 - a1 * 0.5;
+        let a3 = a2 * a2 - a2 * 0.5;
+        let a4 = a3 * a3 - a3 * 0.5;
+        let a5 = a4 * a4 - a4 * 0.5;
+        let a6 = a5 * a5 - a5 * 0.5;
+        let a7 = a6 * a6 - a6 * 0.5;
+        let a8 = a7 * a7 - a7 * 0.5;
+        let a9 = a8 * a8 - a8 * 0.5;
+        let a10 = a9 * a9 - a9 * 0.5;
+        let a11 = a10 * a10 - a10 * 0.5;
+        let a12 = a11 * a11 - a11 * 0.5;
+        let a13 = a12 * a12 - a12 * 0.5;
+        let a14 = a13 * a13 - a13 * 0.5;
+        let a15 = a14 * a14 - a14 * 0.5;
+        let a16 = a15 * a15 - a15 * 0.5;
+        let k0: usize = i % 2;
+        let k1: usize = k0 * k0 + k0 - k0;
+        s = s * (a16 + 1.0) + x[k1] * d[0] * a8;
+    }
+    [s]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -174,6 +218,16 @@ fn triangular_nest() {
 #[test]
 fn plain_rust() {
     check!(plain, [0.4, 0.9, 1.3, -0.2, 0.7], [0.5, -0.8, 1.1, 0.3], 2);
+}
+
+#[test]
+fn shadowed_loop_variable() {
+    check!(shadowed, [1.0, 2.0, 3.0, 5.0], [0.7], 1);
+}
+
+#[test]
+fn chained_locals() {
+    check!(locals, [0.6, -0.4], [0.3], 1);
 }
 
 #[test]

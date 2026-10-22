@@ -74,6 +74,12 @@ pub enum Op {
     Store(Int),
     /// A plain Rust `f64` expression of the loop variables (`i as f64`, `weight(h)`).
     Num(Opaque<f64>),
+    /// `let p<i>: usize = idx;`: an integer local (`let k: usize = MATURITIES[i];`), computed
+    /// once where it is defined; [`Int`]s read it as the variable `p<i>`.
+    LetInt(Int),
+    /// `let p<i>: f64 = ..;`: a plain Rust `f64` local of the loop variables, computed once
+    /// where it is defined; plain Rust expressions read it as `p<i>`.
+    LetNum(Opaque<f64>),
     /// Element `idx` of an array parameter.
     Param {
         /// Input (or data) number of element 0.

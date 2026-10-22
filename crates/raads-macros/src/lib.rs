@@ -75,15 +75,17 @@ pub fn check_kernels(input: TokenStream) -> TokenStream {
 /// Loops run over `lo..hi`. Bounds are integer literals, loop variables and `+ - * / %` of
 /// them (the macro sizes the tape from them); `i as f64` is a loop variable's value. Array
 /// indices, integer locals (`let k: usize = ..;`, not reassigned) and numbers may also be plain
-/// Rust of loop variables, integer locals and constants (`IDX[i]`, `knot(h)`, `RATES[i]`): they
-/// are emitted as written and recomputed in the reverse sweep. Outer variables a loop body
+/// Rust of loop variables, locals and constants (`IDX[i]`, `knot(h)`, `RATES[i]`), emitted as
+/// written. A `let` of one that reads a loop variable is computed once where it is defined,
+/// and again by the reverse sweep; other plain expressions are evaluated where they are used.
+/// Plain Rust must be pure, as it may run more than once. Outer variables a loop body
 /// assigns carry over to the next iteration (they must be `N`s, and a `let` in the body may
-/// not reuse their name), and local arrays `let mut a = [x; LEN];` can be assigned by element
+/// not reuse their name), and local arrays `let mut a = [x; 8];` can be assigned by element
 /// (`a[i] = ..;`) but not copied. Loops stay loops in the generated code: each forward
 /// iteration saves what its reverse needs, so code size does not grow with the trip count.
 ///
 /// Parameter and loop variable names `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`,
-/// `m`, `ac` or `am` followed by digits are reserved by the generated code, as is the generic
+/// `m`, `p`, `ac` or `am` followed by digits are reserved by the generated code, as is the generic
 /// parameter name `R` on a `#[kernels]` `impl`.
 ///
 /// The generated code refers to `raads` by the name the calling crate's `Cargo.toml` gives
@@ -226,13 +228,15 @@ pub(crate) fn compile(mut f: ItemFn, vis: &str, names: [&str; 4], krate: &Tokens
 }
 
 /// The names [`is_reserved`] rejects, for error messages.
-pub(crate) const RESERVED: &str = "reserved: `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`, `m`, `ac` or `am` followed by digits";
+pub(crate) const RESERVED: &str =
+    "reserved: `y`, `res`, `tape`, `tp`, `a_*`, and `v`, `a`, `q`, `c`, `m`, `p`, `ac` or `am` followed by digits";
 
 /// Names the generated code uses next to the parameters and loop variables: `res`
 /// (residuals), `tape` and `tp` (loop tape), `a_y` and `a_<param>` (adjoints), `v<i>` and
 /// `a<i>` (node values and adjoints), `q<i>` (quotients), `c<i>` and `ac<i>` (carried values
-/// and their adjoints), `m<i>` and `am<i>` (local arrays and their adjoints).
+/// and their adjoints), `m<i>` and `am<i>` (local arrays and their adjoints), `p<i>` (plain
+/// Rust locals).
 pub(crate) fn is_reserved(s: &str) -> bool {
     let temp = |p: &str| s.len() > p.len() && s.starts_with(p) && s[p.len()..].bytes().all(|c| c.is_ascii_digit());
-    ["y", "res", "tape", "tp"].contains(&s) || s.starts_with("a_") || ["v", "a", "q", "c", "m", "ac", "am"].into_iter().any(temp)
+    ["y", "res", "tape", "tp"].contains(&s) || s.starts_with("a_") || ["v", "a", "q", "c", "m", "p", "ac", "am"].into_iter().any(temp)
 }

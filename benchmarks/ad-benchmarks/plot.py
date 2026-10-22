@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # scripts/plot_results.py from auto-differentiation/ad-benchmarks (MIT, Copyright (c) 2026
-# Xcelerit Computing Ltd.), with "raads" and "raads SIMD" added to the colours and order.
+# Xcelerit Computing Ltd.), with "raads" and "raads SIMD" added to the colours and order, and a
+# second primal line: raads on one lane, plain f64 Rust.
 """Generate benchmark comparison chart from a results CSV.
 
 Usage:
@@ -89,7 +90,8 @@ def load_results(csv_path):
             mid = len(vals) // 2
             primal_baseline[bench] = (vals[mid] if len(vals) % 2 == 1
                                        else 0.5 * (vals[mid - 1] + vals[mid]))
-    return data, primal_baseline, dnf
+    rust_primal = {b: m["raads"] for b, m in primals.items() if "raads" in m}
+    return data, primal_baseline, rust_primal, dnf
 
 
 def fmt_time(v):
@@ -106,7 +108,7 @@ def fmt_time(v):
 
 # ---- Plot ----------------------------------------------------------------
 
-def plot_benchmarks(data, primal_baseline, dnf, output_path):
+def plot_benchmarks(data, primal_baseline, rust_primal, dnf, output_path):
     benchmarks = [b for b in BENCH_ORDER if b in data]
     n = len(benchmarks)
     if n == 0:
@@ -171,15 +173,14 @@ def plot_benchmarks(data, primal_baseline, dnf, output_path):
         # Pad the x-axis so labels fit
         ax.set_xlim(left=0, right=max_val * 1.30)
 
-        # Vertical primal-baseline reference line
-        primal = primal_baseline.get(bench)
-        if primal is not None and 0 < primal < max_val * 1.30:
-            ax.axvline(primal, color="#444444", linestyle="--",
-                       linewidth=1.0, alpha=0.7, zorder=0)
-            ax.text(primal, -0.85,
-                    f"primal {fmt_time(primal)}",
-                    ha="center", va="bottom", fontsize=7.5,
-                    color="#444444", style="italic")
+        # Vertical primal reference lines, C++ and Rust, labelled in a legend
+        for primal, lang, color in [(primal_baseline.get(bench), "C++", "#444444"),
+                                    (rust_primal.get(bench), "Rust", LIBRARY_COLORS["raads"])]:
+            if primal is not None and 0 < primal < max_val * 1.30:
+                ax.axvline(primal, color=color, linestyle="--", linewidth=1.0,
+                           alpha=0.7, zorder=0, label=f"{lang} primal {fmt_time(primal)}")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="lower right", fontsize=7.5, frameon=False, handlelength=2.2)
 
         # "DNF" labels
         for pos in dnf_positions:
@@ -197,7 +198,7 @@ def plot_benchmarks(data, primal_baseline, dnf, output_path):
     for j in range(len(benchmarks), len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle("AD library gradient time — lower is better. Dashed line: primal (no-AD) baseline.",
+    fig.suptitle("AD library gradient time — lower is better. Dashed lines: primal (no AD) in C++ and Rust.",
                  fontsize=11.5, fontweight="bold", y=1.00)
 
     plt.tight_layout(w_pad=2.5, h_pad=2.6, rect=(0, 0, 1, 0.96))
@@ -214,8 +215,8 @@ def plot_benchmarks(data, primal_baseline, dnf, output_path):
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else "results/results.csv"
     output_path = sys.argv[2] if len(sys.argv) > 2 else "results/chart.png"
-    data, primal_baseline, dnf = load_results(csv_path)
-    plot_benchmarks(data, primal_baseline, dnf, output_path)
+    data, primal_baseline, rust_primal, dnf = load_results(csv_path)
+    plot_benchmarks(data, primal_baseline, rust_primal, dnf, output_path)
 
 
 if __name__ == "__main__":

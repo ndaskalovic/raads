@@ -16,12 +16,13 @@ pub enum Int {
 }
 
 impl Int {
-    /// Value with the loop variables `vars` (name, value); `None` on overflow, a division
-    /// by zero, an unknown variable or a plain Rust expression without [`Opaque::eval`].
-    pub fn eval(&self, vars: &[(String, usize)]) -> Option<usize> {
+    /// Value with the variables `vars` (name, value: loop variables, integer and `f64`
+    /// locals); `None` on overflow, a division by zero, an unknown variable or a plain Rust
+    /// expression without [`Opaque::eval`].
+    pub fn eval(&self, vars: &[(String, f64)]) -> Option<usize> {
         match self {
             Int::Lit(k) => Some(*k),
-            Int::Var(v) => lookup(vars, v),
+            Int::Var(v) => lookup(vars, v).map(|x| x as usize),
             Int::Bin(a, op, b) => {
                 let (a, b) = (a.eval(vars)?, b.eval(vars)?);
                 match op {
@@ -48,7 +49,7 @@ impl Int {
             Int::Opaque(_) => true,
         }
     }
-    /// Loop variables the expression reads.
+    /// Variables the expression reads.
     pub fn vars(&self) -> Vec<String> {
         match self {
             Int::Lit(_) => vec![],
@@ -75,24 +76,25 @@ impl fmt::Display for Int {
     }
 }
 
-/// A plain Rust expression of the loop variables that the macro does not interpret
-/// (`MATURITIES[i]`, `weight(h)`): the generated code evaluates its source where it is
-/// used. A graph built at run time (a kernel's `graph()`) carries `eval`, which computes it
-/// from the values of `vars`, so [`crate::unroll`] can run it.
+/// A plain Rust expression of the loop variables and locals that the macro does not
+/// interpret (`MATURITIES[i]`, `weight(h)`): the generated code evaluates its source. A graph
+/// built at run time (a kernel's `graph()`) carries `eval`, which computes it from the values
+/// of `vars`, so [`crate::unroll`] can run it.
 #[derive(Clone, Debug)]
 pub struct Opaque<T> {
     /// Rust source.
     pub src: String,
-    /// Loop variables it reads.
+    /// Variables it reads: loop variables and locals ([`crate::Op::LetInt`],
+    /// [`crate::Op::LetNum`]).
     pub vars: Vec<String>,
-    /// Its value given the values of `vars`, in order.
-    pub eval: Option<fn(&[usize]) -> T>,
+    /// Its value given the values of `vars`, in order (integers as `f64`).
+    pub eval: Option<fn(&[f64]) -> T>,
 }
 
 impl<T> Opaque<T> {
-    /// Value with the loop variables `vars` (name, value).
-    pub fn call(&self, vars: &[(String, usize)]) -> Option<T> {
-        let vals: Option<Vec<usize>> = self.vars.iter().map(|v| lookup(vars, v)).collect();
+    /// Value with the variables `vars` (name, value).
+    pub fn call(&self, vars: &[(String, f64)]) -> Option<T> {
+        let vals: Option<Vec<f64>> = self.vars.iter().map(|v| lookup(vars, v)).collect();
         Some((self.eval?)(&vals?))
     }
 }
@@ -104,7 +106,7 @@ impl<T> PartialEq for Opaque<T> {
     }
 }
 
-/// Value of the innermost loop variable `v`.
-fn lookup(vars: &[(String, usize)], v: &str) -> Option<usize> {
+/// Value of the innermost variable `v`.
+fn lookup(vars: &[(String, f64)], v: &str) -> Option<f64> {
     vars.iter().rev().find(|(n, _)| n == v).map(|&(_, k)| k)
 }

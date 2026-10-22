@@ -3,8 +3,9 @@
 //! after 3 warm-ups, f64. Inputs and XAD's results come from `ad-benchmarks/reference.cpp`
 //! (target/adbench.bin, target/adbench_reference.txt); results are checked against XAD first.
 //! Prints every lane width and writes the suite's CSV rows to target/adbench_raads.csv: `raads`
-//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR and LIBOR, 16 for XVA). Run by
-//! `ad-benchmarks/run.sh`.
+//! (1 lane) and `raads SIMD` (8 lanes for Heston, 4 for SABR and LIBOR, 16 for XVA). As in
+//! the suite, the primal is the plain function without AD: the kernels called on `f64` (or
+//! packs of them). Run by `ad-benchmarks/run.sh`.
 
 use raads::lanes::{F64x2, F64x4, F64x8, F64x16};
 use raads::prelude::*;
@@ -260,14 +261,30 @@ fn heston_normals<L: Lanes>(raw: &[f64]) -> Vec<f64> {
     z
 }
 
-fn heston<L: Lanes>(raw: &[f64], want: &[f64]) -> (f64, f64) {
+/// The Heston price in plain Rust: the model's functions called on `L`, without the engine.
+fn heston_plain<L: Lanes<Elem = f64>>(p: &[L; 8], z: &[f64]) -> f64 {
+    let c = Heston::setup(*p, L::from(STEPS as f64));
+    let mut v = L::from(0.0);
+    for b in 0..PATHS / L::W {
+        let mut s = Heston::init(*p);
+        for k in 0..STEPS {
+            let z = |j: usize| L::load(&z[((b * STEPS + k) * 2 + j) * L::W..]);
+            s = Heston::step(s, c, [z(0), z(1)]);
+        }
+        v += Heston::functional(s, *p, c);
+    }
+    v.sum() / PATHS as f64
+}
+
+fn heston<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
     let z = heston_normals::<L>(raw);
     let p = HESTON.map(L::from);
     let r = paths::gradient::<Heston, L>(&p, STEPS, PATHS, &z);
     let got: Vec<f64> = std::iter::once(r.value).chain(r.grad).collect();
     check(&format!("heston W={}", L::W), &got, want);
+    check(&format!("heston W={} plain Rust price", L::W), &[heston_plain::<L>(&p, &z)], &want[..1]);
     let primal = median_ms(3, 10, || {
-        black_box(paths::value::<Heston, L>(black_box(&p), STEPS, PATHS, &z).value);
+        black_box(heston_plain::<L>(black_box(&p), &z));
     });
     let grad = median_ms(3, 10, || {
         let r = paths::gradient::<Heston, L>(black_box(&p), STEPS, PATHS, &z);
@@ -297,14 +314,14 @@ fn sabr_iter<L: Lanes<Elem = f64>>(s: &Sabr, params: &[f64; 15]) -> (f64, [f64; 
     (obj, g)
 }
 
-/// Objective only.
+/// Objective only, in plain Rust: the kernel called on `L`.
 fn sabr_obj<L: Lanes<Elem = f64>>(s: &Sabr, params: &[f64; 15]) -> f64 {
     let mut obj = 0.0;
     for e in 0..EXPIRIES {
         let p = [params[3 * e], params[3 * e + 1], params[3 * e + 2]].map(L::from);
         for i in (e * STRIKES..(e + 1) * STRIKES).step_by(L::W) {
             let l = |x: &[f64]| L::load(&x[i..]);
-            obj += sabr_sq::eval(&p, l(&s.f), l(&s.k), l(&s.t), l(&s.beta), l(&s.mkt)).sum();
+            obj += sabr_sq(p, l(&s.f), l(&s.k), l(&s.t), l(&s.beta), l(&s.mkt)).sum();
         }
     }
     obj
@@ -325,6 +342,7 @@ fn sabr<L: Lanes<Elem = f64>>(s: &Sabr, want0: &[f64], want_sum: &[f64]) -> (f64
         }
     }
     check(&format!("sabr W={} sums over 500 iterations", L::W), &std::iter::once(sum_obj).chain(sum_g).collect::<Vec<_>>(), want_sum);
+    check(&format!("sabr W={} plain Rust objective", L::W), &[sabr_obj::<L>(s, &s.init)], &want0[..1]);
     let run = |grad: bool| {
         median_ms(3, 10, || {
             let mut params = s.init;
@@ -377,9 +395,11 @@ fn libor_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
     let (v, g) = grad(&p);
     let got: Vec<f64> = std::iter::once(v).chain(g).map(|x| x.sum() / PATHS as f64).collect();
     check(&format!("libor W={}", L::W), &got, want);
+    let price = z.iter().fold(L::from(0.0), |v, zb| v + libor(p, *zb)).sum() / PATHS as f64;
+    check(&format!("libor W={} plain Rust price", L::W), &[price], &want[..1]);
     let primal = median_ms(3, 10, || {
         let p = black_box(&p);
-        black_box(z.iter().fold(L::from(0.0), |v, zb| v + libor::eval(p, zb)));
+        black_box(z.iter().fold(L::from(0.0), |v, zb| v + libor(*p, *zb)));
     });
     let grad = median_ms(3, 10, || {
         black_box(grad(black_box(&p)));
@@ -412,18 +432,37 @@ fn xva_bench<L: Lanes<Elem = f64>>(raw: &[f64], want: &[f64]) -> (f64, f64) {
     };
     let (v, g) = grad(&p);
     let got: Vec<f64> = std::iter::once(v).chain(g).map(|x| x.sum() / PATHS as f64).collect();
-    // d/d rates[10] and d/d vols[0] are below f64 resolution (benchmarks/README.md): left out
+    // d/d rates[10] and d/d vols[0] are rounding error in f64 (see `xva_rounding`): left out
     let keep = |v: &[f64]| -> Vec<f64> { v.iter().enumerate().filter(|(i, _)| ![11, 31].contains(i)).map(|(_, &x)| x).collect() };
     check(&format!("xva W={} (without rates[10], vols[0])", L::W), &keep(&got), &keep(want));
+    let price = z.iter().fold(L::from(0.0), |v, zb| v + xva(p, *zb)).sum() / PATHS as f64;
+    check(&format!("xva W={} plain Rust price", L::W), &[price], &want[..1]);
     let primal = median_ms(3, 10, || {
         let p = black_box(&p);
-        black_box(z.iter().fold(L::from(0.0), |v, zb| v + xva::eval(p, zb)));
+        black_box(z.iter().fold(L::from(0.0), |v, zb| v + xva(*p, *zb)));
     });
     let grad = median_ms(3, 10, || {
         black_box(grad(black_box(&p)));
     });
     println!("raads xva W={:2}: primal {primal:.3} ms, gradient {grad:.3} ms", L::W);
     (primal, grad)
+}
+
+/// The two XVA gradients left out of the check: reverse and forward mode (`Dual`) of the
+/// same kernel, exact in real arithmetic, give different values, which only rounding explains.
+fn xva_rounding(raw: &[f64], want: &[f64]) {
+    let z = path_normals::<f64, 40>(raw);
+    let p = xva_params::<f64>();
+    let mut rev = [0.0; 40];
+    for zb in &z {
+        xva::vjp(&p, zb, 1.0, &mut rev);
+    }
+    for (j, name) in [(10, "rates[10]"), (30, "vols[0]")] {
+        let dp: [Dual<f64>; 40] = std::array::from_fn(|k| Dual::new(p[k], (k == j) as u8 as f64));
+        let fwd: f64 = z.iter().map(|zb| xva(dp, zb.map(Dual::from)).t).sum();
+        let (r, f) = (rev[j] / PATHS as f64, fwd / PATHS as f64);
+        println!("xva d/d {name}: reverse {r:.4e}, forward {f:.4e} ({:+.0}%), XAD {:.4e}", (f / r - 1.0) * 100.0, want[j + 1]);
+    }
 }
 
 fn main() {
@@ -472,6 +511,7 @@ fn main() {
     xva_bench::<F64x4>(&xz, &x);
     xva_bench::<F64x8>(&xz, &x);
     let x16 = xva_bench::<F64x16>(&xz, &x);
+    xva_rounding(&xz, &x);
     let rows: String = [
         ("raads", "HestonMC", h1),
         ("raads SIMD", "HestonMC", h8),
