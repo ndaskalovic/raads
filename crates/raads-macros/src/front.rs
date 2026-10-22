@@ -13,16 +13,17 @@
 //! array parameters, read and written through [`Op::Load`], [`Op::Store`], [`Op::Param`].
 //! Indices the macro cannot evaluate (`MATURITIES[i]`, `interval(h)`) and plain `f64`
 //! expressions of loop variables (`i as f64`, `weight(h)`) stay Rust source
-//! ([`Opaque`]). A `let` of one (`let k: usize = ..;`, `let w = weight(h);`) becomes a local
-//! of the generated code ([`Op::LetInt`], [`Op::LetNum`]), computed once where it is defined
-//! and read by name.
+//! ([`Opaque`]). A `let` of a computed integer or a plain `f64` expression (`let k: usize =
+//! ..;`, `let w = weight(h);`) becomes a local of the generated code ([`Op::LetInt`],
+//! [`Op::LetNum`]), computed once where it is defined and read by name. A plain `f64` that reads
+//! only locals of constants is still a constant.
 //!
 //! It also returns the function body rewritten so it compiles for any `N: AdNum`
 //! (`2 * x` becomes `x.rmul(2f64)`, `x.maximum(0.0)` becomes `x.maximum(N::from(0.0))`),
 //! which is the eager / tracer version of the kernel.
 
 use proc_macro2::{Ident, Literal, Span, TokenStream, TokenTree};
-use quote::{ToTokens, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use raads_codegen::{Graph, Int, NONE, Op, Opaque, f64_literal};
 use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
@@ -32,8 +33,9 @@ use syn::{BinOp, Error, Expr, Lit, Pat, Result, Stmt, UnOp};
 #[derive(Clone, Debug)]
 pub enum F {
     Num(f64),
-    /// Rust source for the generated code and the loop variables it reads. One that reads
-    /// loop variables becomes an [`Op::Num`] node where a number is needed, not a constant.
+    /// Rust source for the generated code and the loop variables and locals it reads. One
+    /// that reads loop variables, or locals computed from them, becomes an [`Op::Num`] node
+    /// where a number is needed, not a constant.
     Expr(TokenStream, Vec<String>),
 }
 
@@ -45,7 +47,7 @@ impl F {
             F::Expr(t, _) => format!("({t})"),
         }
     }
-    /// Loop variables the value reads.
+    /// Loop variables and locals the value reads.
     fn vars(&self) -> &[String] {
         match self {
             F::Num(_) => &[],
@@ -105,6 +107,9 @@ pub struct Builder {
     ilocals: HashMap<String, Int>,
     /// Variables of [`Op::LetNum`]s, which are `f64`s (other variables are `usize`).
     num_lets: HashSet<String>,
+    /// Variables of lets ([`Op::LetInt`], [`Op::LetNum`]) that read no loop variable: plain
+    /// values that read only these are constants.
+    const_lets: HashSet<String>,
     /// The kernel's number type parameter and the path of `raads`.
     n: Ident,
     krate: TokenStream,
@@ -127,6 +132,7 @@ impl Builder {
             carried: Vec::new(),
             ilocals: HashMap::new(),
             num_lets: HashSet::new(),
+            const_lets: HashSet::new(),
             n: n.clone(),
             krate: krate.clone(),
         };
@@ -156,10 +162,15 @@ impl Builder {
         self.g.push(op, a, b, c, d)
     }
 
+    /// `vars` include a loop variable, or a let computed from one.
+    fn varies(&self, vars: &[String]) -> bool {
+        vars.iter().any(|v| !self.const_lets.contains(v))
+    }
+
     fn konst(&mut self, f: &F) -> usize {
-        let op = match f.vars() {
-            [] => Op::Const(f.source()),
-            vars => Op::Num(Opaque { src: f.source(), vars: vars.to_vec(), eval: None }),
+        let op = match self.varies(f.vars()) {
+            false => Op::Const(f.source()),
+            true => Op::Num(Opaque { src: f.source(), vars: f.vars().to_vec(), eval: None }),
         };
         let i = self.push(op, NONE, NONE, NONE, NONE);
         self.consts[i] = Some(f.clone());
@@ -186,14 +197,18 @@ impl Builder {
         Ok(())
     }
 
-    /// `v` with each plain `f64` that reads loop variables replaced by a local of the
-    /// generated code, computed here: where the value is defined, not where it is used.
+    /// `v` with each plain `f64` expression replaced by a local of the generated code,
+    /// computed here, where the value is defined: not pasted where it is used.
     fn local(&mut self, v: Val) -> Val {
         match v {
-            Val::F(F::Expr(t, vars)) if !vars.is_empty() => {
+            Val::F(F::Expr(t, vars)) => {
+                let fixed = !self.varies(&vars);
                 let j = self.push(Op::LetNum(Opaque { src: t.to_string(), vars, eval: None }), NONE, NONE, NONE, NONE);
                 let name = format!("p{j}");
                 self.num_lets.insert(name.clone());
+                if fixed {
+                    self.const_lets.insert(name.clone());
+                }
                 Val::F(F::Expr(name.parse().unwrap(), vec![name]))
             }
             Val::Arr(vs) => Val::Arr(vs.into_iter().map(|v| self.local(v)).collect()),
@@ -253,7 +268,14 @@ impl Builder {
                     }
                     let k = match self.int(&init.expr)? {
                         Int::Lit(k) => Int::Lit(k),
-                        k => Int::Var(format!("p{}", self.push(Op::LetInt(k), NONE, NONE, NONE, NONE))),
+                        k => {
+                            let fixed = !self.varies(&k.vars());
+                            let var = format!("p{}", self.push(Op::LetInt(k), NONE, NONE, NONE, NONE));
+                            if fixed {
+                                self.const_lets.insert(var.clone());
+                            }
+                            Int::Var(var)
+                        }
                     };
                     self.env.remove(&name);
                     self.params.remove(&name);
@@ -387,6 +409,10 @@ impl Builder {
             Expr::Lit(syn::ExprLit { lit: Lit::Int(k), .. }) => Ok(Int::Lit(k.base10_parse()?)),
             _ if name.as_ref().is_some_and(|n| self.ints.contains(n)) => Ok(Int::Var(name.unwrap())),
             _ if name.as_ref().is_some_and(|n| self.ilocals.contains_key(n)) => Ok(self.ilocals[&name.unwrap()].clone()),
+            _ if name.as_ref().is_some_and(|n| matches!(self.env.get(n), Some(Val::F(_)))) => {
+                let n = name.unwrap();
+                err(e.span(), &format!("`{n}` is an `f64`: an integer local is declared with its type, `let {n}: usize = ..;`"))
+            }
             Expr::Paren(p) => self.int(&p.expr),
             Expr::Group(g) => self.int(&g.expr),
             Expr::Binary(b) if matches!(b.op, BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_) | BinOp::Rem(_)) => {
@@ -738,7 +764,7 @@ impl Builder {
             "powf" => {
                 arity(1)?;
                 let k = fk(0)?;
-                if !k.vars().is_empty() {
+                if self.varies(k.vars()) {
                     return err(m.args[0].span(), "the exponent of `powf` cannot depend on a loop variable");
                 }
                 self.unary(Op::Powk(k.source()), x)
@@ -855,6 +881,17 @@ impl Builder {
     /// for comparison with the tracer.
     pub fn graph_code(&self) -> TokenStream {
         let krate = &self.krate;
+        // constants read the constant lets by name
+        let lets = self.g.nodes.iter().enumerate().filter(|(i, _)| self.const_lets.contains(&format!("p{i}"))).map(|(i, n)| {
+            let id = format_ident!("p{i}");
+            let (ty, src) = match &n.op {
+                Op::LetInt(k) => (quote!(usize), k.to_string()),
+                Op::LetNum(x) => (quote!(f64), x.src.clone()),
+                op => unreachable!("{op:?} is not a let"),
+            };
+            let t: TokenStream = src.parse().unwrap();
+            quote!(#[allow(unused_variables)] let #id: #ty = #t;)
+        });
         let nodes = self.g.nodes.iter().enumerate().map(|(i, n)| {
             let arg = |x: usize| if x == NONE { quote!(#krate::__private::codegen::NONE) } else { quote!(#x) };
             let (a, b, c, d) = (arg(n.a), arg(n.b), arg(n.c), arg(n.d));
@@ -923,6 +960,7 @@ impl Builder {
         });
         let outs = &self.g.outs;
         quote! {
+            #(#lets)*
             let mut g = #krate::__private::codegen::Graph::default();
             #(#nodes)*
             g.outs = vec![#(#outs),*];
@@ -978,7 +1016,7 @@ fn has_mem(v: &Val) -> bool {
     }
 }
 
-/// Add the loop variables `new` to `vars`.
+/// Add the variables `new` to `vars`.
 fn add_vars(vars: &mut Vec<String>, new: &[String]) {
     for v in new {
         if !vars.contains(v) {

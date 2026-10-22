@@ -110,7 +110,7 @@ pub fn libor<N: AdNum>(p: [N; 161], #[data] z: [N; 40]) -> N {
 }
 
 /// Interval `k` of `tenors` holding time `t`, as src/xva.hpp interpolates a curve `x`:
-/// `x[k] * (1 - w) + x[k + 1] * w` with `w = weight(tenors, t)`, flat outside the tenors.
+/// `x[k] * (1 - w) + x[k + 1] * w` with `w = weight(tenors, k, t)`, flat outside the tenors.
 fn knot(tenors: &[f64], t: f64) -> usize {
     let n = tenors.len();
     if t <= tenors[0] {
@@ -122,17 +122,9 @@ fn knot(tenors: &[f64], t: f64) -> usize {
     }
 }
 
-/// Interpolation weight of `tenors[knot(tenors, t) + 1]` at time `t`.
-fn weight(tenors: &[f64], t: f64) -> f64 {
-    let n = tenors.len();
-    if t <= tenors[0] {
-        0.0
-    } else if t >= tenors[n - 1] {
-        1.0
-    } else {
-        let k = knot(tenors, t);
-        (t - tenors[k]) / (tenors[k + 1] - tenors[k])
-    }
+/// Interpolation weight of `tenors[k + 1]` at time `t`, with `k = knot(tenors, t)`.
+fn weight(tenors: &[f64], k: usize, t: f64) -> f64 {
+    ((t - tenors[k]) / (tenors[k + 1] - tenors[k])).clamp(0.0, 1.0)
 }
 
 /// CVA of a portfolio of 15 swaps on one path (src/xva.hpp, `xva_compute_cva`): every
@@ -159,12 +151,12 @@ pub fn xva<N: AdNum>(p: [N; 40], #[data] z: [N; 40]) -> N {
             for i in 0..19 - b {
                 let t1 = t + (i + 1) as f64 * XVA_DT;
                 let k1: usize = knot(&XVA_RATE_TENORS, t1);
-                let w1 = weight(&XVA_RATE_TENORS, t1);
+                let w1 = weight(&XVA_RATE_TENORS, k1, t1);
                 let df = (-(d[k1] * (1.0 - w1) + d[k1 + 1] * w1) * t1).exp();
                 fixed = fixed + XVA_NOTIONAL * (0.02 + 0.001 * s as f64) * XVA_DT * df;
                 let t0 = t + i as f64 * XVA_DT;
                 let k0: usize = knot(&XVA_RATE_TENORS, t0);
-                let w0 = weight(&XVA_RATE_TENORS, t0);
+                let w0 = weight(&XVA_RATE_TENORS, k0, t0);
                 let df_prev = (-(d[k0] * (1.0 - w0) + d[k0 + 1] * w0) * t0).exp();
                 let fwd = (df_prev / df - 1.0) / XVA_DT;
                 float = float + XVA_NOTIONAL * XVA_DT * fwd * df;
@@ -174,13 +166,13 @@ pub fn xva<N: AdNum>(p: [N; 40], #[data] z: [N; 40]) -> N {
         }
         let exposure = pv.relu();
         let kp: usize = knot(&XVA_HAZARD_TENORS, t - XVA_DT);
-        let wp = weight(&XVA_HAZARD_TENORS, t - XVA_DT);
+        let wp = weight(&XVA_HAZARD_TENORS, kp, t - XVA_DT);
         let surv_prev = (-(p[20 + kp] * (1.0 - wp) + p[21 + kp] * wp) * (t - XVA_DT)).exp();
         let kh: usize = knot(&XVA_HAZARD_TENORS, t);
-        let wh = weight(&XVA_HAZARD_TENORS, t);
+        let wh = weight(&XVA_HAZARD_TENORS, kh, t);
         let surv = (-(p[20 + kh] * (1.0 - wh) + p[21 + kh] * wh) * t).exp();
         let k: usize = knot(&XVA_RATE_TENORS, t);
-        let w = weight(&XVA_RATE_TENORS, t);
+        let w = weight(&XVA_RATE_TENORS, k, t);
         let df = (-(p[k] * (1.0 - w) + p[k + 1] * w) * t).exp();
         cva = cva + exposure * (surv_prev - surv) * df;
     }

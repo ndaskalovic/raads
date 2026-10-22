@@ -76,9 +76,9 @@ pub fn check_kernels(input: TokenStream) -> TokenStream {
 /// them (the macro sizes the tape from them); `i as f64` is a loop variable's value. Array
 /// indices, integer locals (`let k: usize = ..;`, not reassigned) and numbers may also be plain
 /// Rust of loop variables, locals and constants (`IDX[i]`, `knot(h)`, `RATES[i]`), emitted as
-/// written. A `let` of one that reads a loop variable is computed once where it is defined,
-/// and again by the reverse sweep; other plain expressions are evaluated where they are used.
-/// Plain Rust must be pure, as it may run more than once. Outer variables a loop body
+/// written. A `let` of a computed integer or of a plain number is computed once where it is
+/// defined, and again by the reverse sweep; other plain expressions are evaluated where they
+/// are used. Plain Rust must be pure, as it may run more than once. Outer variables a loop body
 /// assigns carry over to the next iteration (they must be `N`s, and a `let` in the body may
 /// not reuse their name), and local arrays `let mut a = [x; 8];` can be assigned by element
 /// (`a[i] = ..;`) but not copied. Loops stay loops in the generated code: each forward

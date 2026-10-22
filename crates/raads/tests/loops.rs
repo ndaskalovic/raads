@@ -145,6 +145,37 @@ fn locals<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
     [s]
 }
 
+/// Constant plain locals: a chain, each read several times (computed once, so the expansion
+/// grows linearly with the chain), and `powf` exponents from constant `f64` and `usize` locals.
+#[kernel]
+fn constants<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let a0 = weight(5);
+    let a1 = a0 * a0 - a0 * 0.5;
+    let a2 = a1 * a1 - a1 * 0.5;
+    let a3 = a2 * a2 - a2 * 0.5;
+    let a4 = a3 * a3 - a3 * 0.5;
+    let a5 = a4 * a4 - a4 * 0.5;
+    let a6 = a5 * a5 - a5 * 0.5;
+    let a7 = a6 * a6 - a6 * 0.5;
+    let a8 = a7 * a7 - a7 * 0.5;
+    let a9 = a8 * a8 - a8 * 0.5;
+    let a10 = a9 * a9 - a9 * 0.5;
+    let a11 = a10 * a10 - a10 * 0.5;
+    let a12 = a11 * a11 - a11 * 0.5;
+    let a13 = a12 * a12 - a12 * 0.5;
+    let a14 = a13 * a13 - a13 * 0.5;
+    let a15 = a14 * a14 - a14 * 0.5;
+    let a16 = a15 * a15 - a15 * 0.5;
+    let e = W[2] - 0.5;
+    let k: usize = IDX[0];
+    let mut s = x[0].powf(e) * a16 + x[1].powf(k as f64);
+    for i in 0..3 {
+        let b = a8 * weight(LAST);
+        s = s * x[1].powf(e + b) + d[0] * (i as f64) * a16 + x[0].powf(k as f64 + 1.0);
+    }
+    [s]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -228,6 +259,11 @@ fn shadowed_loop_variable() {
 #[test]
 fn chained_locals() {
     check!(locals, [0.6, -0.4], [0.3], 1);
+}
+
+#[test]
+fn constant_locals() {
+    check!(constants, [0.6, 1.3], [0.3], 1);
 }
 
 #[test]
