@@ -1,0 +1,13 @@
+error: `j` is a `usize` local: kernels do not reassign integers
+ --> tests/ui/plain_int_assign.rs:8:9
+  |
+8 |         j = j + 1;
+  |         ^
+
+warning: unused import: `AdNum`
+ --> tests/ui/plain_int_assign.rs:1:13
+  |
+1 | use raads::{AdNum, kernel};
+  |             ^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

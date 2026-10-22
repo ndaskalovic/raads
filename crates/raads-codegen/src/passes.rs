@@ -85,8 +85,8 @@ pub fn need(g: &Graph) -> Vec<bool> {
 }
 
 /// Node value is needed by the forward evaluation of the outputs (all operands count).
-/// Loop markers are always live, stores into live arrays and updates of live carried values
-/// too.
+/// Loop markers and plain Rust locals (read by name, not as operands) are always live,
+/// stores into live arrays and updates of live carried values too.
 pub fn live(g: &Graph) -> Vec<bool> {
     let mut l = vec![false; g.len()];
     for &o in &g.outs {
@@ -98,7 +98,7 @@ pub fn live(g: &Graph) -> Vec<bool> {
         for i in (0..g.len()).rev() {
             let n = &g.nodes[i];
             let keep = match n.op {
-                Op::Loop(..) | Op::End => true,
+                Op::Loop(..) | Op::End | Op::LetInt(_) | Op::LetNum(_) => true,
                 Op::Next | Op::Store(_) => l[n.a],
                 _ => l[i],
             };
@@ -152,12 +152,12 @@ pub fn reads(g: &Graph, need: &[bool]) -> Vec<bool> {
     rd
 }
 
-/// Recomputed by the reverse sweep instead of saved: data, constants and loop indices as
-/// numbers, and with `inputs`
-/// (a `vjp`, which has the inputs) elements of input arrays read in a loop.
+/// Recomputed by the reverse sweep instead of saved: data, constants, plain Rust numbers,
+/// and with `inputs` (a `vjp`, which has the inputs) elements of input arrays read with a
+/// computed index.
 pub fn remat(g: &Graph, i: usize, inputs: bool) -> bool {
     match g.nodes[i].op {
-        Op::Data(_) | Op::Const(_) | Op::Int(_) => true,
+        Op::Data(_) | Op::Const(_) | Op::Num(_) => true,
         Op::Param { data, .. } => data || inputs,
         _ => false,
     }
@@ -174,7 +174,7 @@ pub fn residuals(g: &Graph, reads: &[bool]) -> Vec<usize> {
 /// Errors if a bound cannot be evaluated (overflow, division by zero). Walks the iterations of
 /// every loop that contains loops; an innermost loop only adds its trip count.
 pub fn runs(g: &Graph) -> Result<Vec<usize>, String> {
-    fn go(g: &Graph, ends: &[usize], from: usize, to: usize, vars: &mut Vec<(String, usize)>, runs: &mut [usize]) -> Result<(), String> {
+    fn go(g: &Graph, ends: &[usize], from: usize, to: usize, vars: &mut Vec<(String, f64)>, runs: &mut [usize]) -> Result<(), String> {
         let mut i = from;
         while i < to {
             if let Op::Loop(var, lo, hi) = &g.nodes[i].op {
@@ -187,7 +187,7 @@ pub fn runs(g: &Graph) -> Result<Vec<usize>, String> {
                 }
                 for k in lo..hi {
                     runs[i] += 1;
-                    vars.push((var.clone(), k));
+                    vars.push((var.clone(), k as f64));
                     go(g, ends, i + 1, ends[i], vars, runs)?;
                     vars.pop();
                 }
@@ -238,14 +238,19 @@ impl Analysis {
     pub fn saved(&self, g: &Graph, lp: usize, inputs: bool) -> Vec<usize> {
         (lp + 1..self.ends[lp]).filter(|&i| self.reads[i] && self.parents[i] == lp && !remat(g, i, inputs)).collect()
     }
-    /// Values of the loop body `lp` the reverse sweep recomputes at the start of an iteration
-    /// (parameter elements and loop indices; constants are inlined where they are used).
+    /// Values of the loop body `lp` the reverse sweep recomputes at the start of an iteration,
+    /// in node order: plain Rust locals, and parameter elements and plain Rust numbers it
+    /// reads (constants are inlined where they are used).
     pub fn rematerialised(&self, g: &Graph, lp: usize, inputs: bool) -> Vec<usize> {
-        (lp + 1..self.ends[lp])
-            .filter(|&i| {
-                self.reads[i] && self.parents[i] == lp && matches!(g.nodes[i].op, Op::Param { .. } | Op::Int(_)) && remat(g, i, inputs)
-            })
-            .collect()
+        (lp + 1..self.ends[lp]).filter(|&i| self.parents[i] == lp && self.recomputed(g, i, inputs)).collect()
+    }
+    /// The reverse sweep recomputes node `i` where its scope starts (see [`Self::rematerialised`]).
+    pub fn recomputed(&self, g: &Graph, i: usize, inputs: bool) -> bool {
+        match g.nodes[i].op {
+            Op::LetInt(_) | Op::LetNum(_) => true,
+            Op::Param { .. } | Op::Num(_) => self.reads[i] && remat(g, i, inputs),
+            _ => false,
+        }
     }
     /// Length of the loop tape: saved values over all iterations of all loops.
     pub fn tape(&self, g: &Graph, inputs: bool) -> usize {

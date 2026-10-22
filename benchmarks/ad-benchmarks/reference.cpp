@@ -1,19 +1,22 @@
-// Inputs and XAD reference results for the ad-benchmarks Heston MC, SABR calibration and LIBOR
-// swaption workloads, from that repository's own headers (src/heston.hpp, src/sabr.hpp,
-// src/libor_swaption.hpp), so raads runs on identical inputs and can be checked against XAD.
+// Inputs and XAD reference results for the ad-benchmarks Heston MC, SABR calibration, LIBOR
+// swaption and XVA workloads, from that repository's own headers (src/heston.hpp, src/sabr.hpp,
+// src/libor_swaption.hpp, src/xva.hpp), so raads runs on identical inputs and can be checked
+// against XAD.
 //
 // Writes target/adbench.bin (little-endian f64):
 //   Heston: per path, z1[100] then z2[100] (10000 paths)
 //   SABR:   per expiry F, T, beta, strikes[20], market_vols[20]; initial params[15];
 //           perturbation schedule[500][15]
 //   LIBOR:  per path, z[40] (10000 paths)
+//   XVA:    per path, z[40] (10000 paths)
 // and prints the XAD values: Heston price and gradient; SABR objective and gradient at the
 // first iteration, and the sums over all 500 iterations; LIBOR price and gradient (delta,
-// lambda[80], L0[80]).
+// lambda[80], L0[80]); XVA CVA and gradient (rates[20], hazard[10], vols[10]).
 
 #include "src/heston.hpp"
 #include "src/libor_swaption.hpp"
 #include "src/sabr.hpp"
+#include "src/xva.hpp"
 #include <XAD/XAD.hpp>
 #include <cstdio>
 
@@ -61,6 +64,10 @@ int main()
     auto portfolio = defaultPortfolio();
     auto lz = libor_generate_all_samples(paths, market.lambda.size() / 2, 12354);
     for (auto& zp : lz)
+        for (double z : zp) put(f, z);
+    // the draws of xad/xva_xad.cpp
+    auto xz = xva_generate_samples(paths, 99999);
+    for (auto& zp : xz)
         for (double z : zp) put(f, z);
     fclose(f);
 
@@ -143,5 +150,33 @@ int main()
     }
     printf("libor %.17g", lprice / paths);
     for (double v : lg) printf(" %.17g", v / paths);
+    printf("\n");
+
+    // XVA: pathwise adjoints, as in xad/xva_xad.cpp
+    XVAMarketData xm;
+    auto swaps = xva_default_portfolio();
+    double xprice = 0, xg[XVA_NUM_MARKET_INPUTS] = {};
+    for (int p = 0; p < paths; ++p)
+    {
+        tape.clearAll();
+        AD rates[XVA_NUM_RATES], hazard[XVA_NUM_HAZARD], vols[XVA_NUM_VOLS];
+        for (int i = 0; i < XVA_NUM_RATES; ++i) rates[i] = xm.rates[i];
+        for (int i = 0; i < XVA_NUM_HAZARD; ++i) hazard[i] = xm.hazard[i];
+        for (int i = 0; i < XVA_NUM_VOLS; ++i) vols[i] = xm.vols[i];
+        for (auto& v : rates) tape.registerInput(v);
+        for (auto& v : hazard) tape.registerInput(v);
+        for (auto& v : vols) tape.registerInput(v);
+        tape.newRecording();
+        AD cva = xva_compute_cva(rates, hazard, vols, xz[p].data(), swaps);
+        tape.registerOutput(cva);
+        derivative(cva) = 1.0;
+        tape.computeAdjoints();
+        xprice += value(cva);
+        for (int i = 0; i < XVA_NUM_RATES; ++i) xg[i] += derivative(rates[i]);
+        for (int i = 0; i < XVA_NUM_HAZARD; ++i) xg[XVA_NUM_RATES + i] += derivative(hazard[i]);
+        for (int i = 0; i < XVA_NUM_VOLS; ++i) xg[XVA_NUM_RATES + XVA_NUM_HAZARD + i] += derivative(vols[i]);
+    }
+    printf("xva %.17g", xprice / paths);
+    for (double v : xg) printf(" %.17g", v / paths);
     printf("\n");
 }
