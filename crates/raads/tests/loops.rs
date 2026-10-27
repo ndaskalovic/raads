@@ -176,8 +176,8 @@ fn constants<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
     [s]
 }
 
-/// Untyped lets of constants keep their Rust type (`n`, `k`, `j`, `n2`, `k3`, `t`, `c` are
-/// `usize`s), and `as f64` of an `f64` local.
+/// Lets of constants keep their Rust type (`n`, `k`, `j`, `n2`, `k3`, `t`, `c` are
+/// `usize`s) or the one written (`ws`), and `as f64` of an `f64` local.
 #[kernel]
 #[allow(clippy::unnecessary_cast)]
 fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
@@ -190,10 +190,11 @@ fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
     let k3 = IDX[n2 - 1];
     let (t, b) = (LAST, a * 2.0);
     let c = pick(3);
-    let mut s = x[n] * weight(k) + x[j] * (a as f64) + x[k3] * (t as f64) * b * ((a) as f64);
+    let ws: f64 = W.iter().sum();
+    let mut s = x[n] * ws * weight(k) + x[j] * (a as f64) + x[k3] * (t as f64) * b * ((a) as f64);
     for i in 0..2 {
         let w = weight(i + k);
-        s = s * (w as f64) * ((w * 2.0) as f64) + x[n - i] * d[0];
+        s = s * (w as f64) * ((w * 2.0) as f64) + x[n - i] * d[0] * (weight(i) * ws);
         for pick in 0..2 {
             s = s + x[pick] * (c as f64);
         }

@@ -383,7 +383,7 @@ impl Emitter<'_> {
                 Op::Array(len) => writeln!(s, "    let mut m{i}: [{}; {len}] = [{}; {len}];", self.ty(i), self.as_ty(i, n.a)).unwrap(),
                 Op::Load(idx) => writeln!(s, "    let v{i}: {} = m{}[{idx}];", self.ty(i), n.a).unwrap(),
                 Op::Store(idx) => writeln!(s, "    m{}[{idx}] = {};", n.a, self.as_ty(n.a, n.b)).unwrap(),
-                Op::Param { .. } | Op::Num(_) | Op::LetInt(_) | Op::LetNum(_) | Op::LetConst(_) => {
+                Op::Param { .. } | Op::Num(_) | Op::LetInt(_) | Op::LetNum(_) | Op::LetConst { .. } => {
                     writeln!(s, "    {}", self.recompute(i)).unwrap()
                 }
                 _ if self.act(i) => writeln!(s, "    let v{i}: R = {};", self.active_value(n)).unwrap(),
@@ -400,7 +400,8 @@ impl Emitter<'_> {
             Op::Num(x) => format!("let v{i}: R::Lanes = <R::Lanes as ::core::convert::From<f64>>::from({});", x.src),
             Op::LetInt(idx) => format!("let p{i}: usize = {idx};"),
             Op::LetNum(x) => format!("let p{i}: f64 = {};", x.src),
-            Op::LetConst(src) => format!("let p{i} = {src};"),
+            Op::LetConst { src, ty: Some(ty) } => format!("let p{i}: {ty} = {src};"),
+            Op::LetConst { src, ty: None } => format!("let p{i} = {src};"),
             op => unreachable!("{op:?} is not recomputed"),
         }
     }
@@ -543,7 +544,7 @@ impl Emitter<'_> {
             | Op::Num(_)
             | Op::LetInt(_)
             | Op::LetNum(_)
-            | Op::LetConst(_) => vec![],
+            | Op::LetConst { .. } => vec![],
             _ => n.args().collect(),
         }
     }

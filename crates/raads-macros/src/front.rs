@@ -197,12 +197,13 @@ impl Builder {
         }
     }
 
-    /// Bind `name` (a `let` or an assignment); it no longer names an array parameter.
-    fn set(&mut self, name: String, v: Val, span: Span) -> Result<()> {
+    /// Bind `name` (a `let`, with the type `ty` the user wrote, or an assignment); it no
+    /// longer names an array parameter.
+    fn set(&mut self, name: String, v: Val, span: Span, ty: Option<&syn::Type>) -> Result<()> {
         if self.ints.contains(&name) {
             return err(span, &format!("`{name}` shadows a loop variable"));
         }
-        let v = self.local(v);
+        let v = self.local(v, ty);
         self.params.remove(&name);
         self.ilocals.remove(&name);
         self.env.insert(name, v);
@@ -211,11 +212,12 @@ impl Builder {
 
     /// `v` with each plain expression replaced by a local of the generated code, computed
     /// here, where the value is defined: not pasted where it is used. One of constants only
-    /// keeps the type Rust infers for it (`let n = LAST;` may be a `usize`).
-    fn local(&mut self, v: Val) -> Val {
+    /// keeps the type `ty` or the one Rust infers for it (`let n = LAST;` may be a `usize`).
+    fn local(&mut self, v: Val, ty: Option<&syn::Type>) -> Val {
         match v {
             Val::F(F::Expr(t, vars)) if !self.varies(&vars) => {
-                let j = self.push(Op::LetConst(t.to_string()), NONE, NONE, NONE, NONE);
+                let ty = ty.map(|t| t.to_token_stream().to_string());
+                let j = self.push(Op::LetConst { src: t.to_string(), ty }, NONE, NONE, NONE, NONE);
                 Val::F(F::Expr(format_ident!("p{j}").into_token_stream(), vec![]))
             }
             Val::F(F::Expr(t, vars)) => {
@@ -224,7 +226,7 @@ impl Builder {
                 self.num_lets.insert(name.clone());
                 Val::F(F::Expr(name.parse().unwrap(), vec![name]))
             }
-            Val::Arr(vs) => Val::Arr(vs.into_iter().map(|v| self.local(v)).collect()),
+            Val::Arr(vs) => Val::Arr(vs.into_iter().map(|v| self.local(v, None)).collect()),
             v => v,
         }
     }
@@ -304,7 +306,7 @@ impl Builder {
                     if has_mem(&v) && !matches!(&*init.expr, Expr::Repeat(_)) {
                         return err(init.expr.span(), "copying a local array is not supported: index it instead");
                     }
-                    self.bind(&l.pat, v)?;
+                    self.bind(&l.pat, v, None)?;
                     // an `f64` local is an `f64` in the rewritten source too, so a type error
                     // points at the `let`
                     let pat = &l.pat;
@@ -347,7 +349,7 @@ impl Builder {
                     if has_mem(&v) {
                         return err(a.right.span(), "copying a local array is not supported: index it instead");
                     }
-                    self.set(name, v, a.left.span())?;
+                    self.set(name, v, a.left.span(), None)?;
                     let l = &a.left;
                     out.extend(quote!(#l = #e;));
                 }
@@ -513,16 +515,21 @@ impl Builder {
         }
     }
 
-    fn bind(&mut self, pat: &Pat, v: Val) -> Result<()> {
+    /// `ty`: the type the user wrote for `pat`.
+    fn bind(&mut self, pat: &Pat, v: Val, ty: Option<&syn::Type>) -> Result<()> {
         match (pat, v) {
             (Pat::Ident(p), _) if self.carried.contains(&p.ident.to_string()) => {
                 err(p.span(), &format!("`{}` is carried to the next iteration: a `let` here would hide it, use another name", p.ident))
             }
-            (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span()),
-            (Pat::Type(t), v) => self.bind(&t.pat, v),
+            (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span(), ty),
+            (Pat::Type(t), v) => self.bind(&t.pat, v, Some(&t.ty)),
             (Pat::Wild(_), _) => Ok(()),
-            (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => t.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v)),
-            (Pat::Slice(s), Val::Arr(vs)) if s.elems.len() == vs.len() => s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v)),
+            (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => {
+                t.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, None))
+            }
+            (Pat::Slice(s), Val::Arr(vs)) if s.elems.len() == vs.len() => {
+                s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, None))
+            }
             (p, _) => err(p.span(), "unsupported pattern (use a name, `_`, or a tuple/array of them)"),
         }
     }
@@ -910,7 +917,7 @@ impl Builder {
     pub fn graph_code(&self) -> TokenStream {
         let krate = &self.krate;
         // constants read the lets of constants by name
-        let lets = self.const_defs();
+        let lets = self.const_defs(None);
         let nodes = self.g.nodes.iter().enumerate().map(|(i, n)| {
             let arg = |x: usize| if x == NONE { quote!(#krate::__private::codegen::NONE) } else { quote!(#x) };
             let (a, b, c, d) = (arg(n.a), arg(n.b), arg(n.c), arg(n.d));
@@ -974,7 +981,13 @@ impl Builder {
                     let x = self.opaque_code(x, quote!(f64));
                     quote!(LetNum(#x))
                 }
-                Op::LetConst(src) => quote!(LetConst(#src.to_string())),
+                Op::LetConst { src, ty } => {
+                    let ty = match ty {
+                        Some(t) => quote!(Some(#t.to_string())),
+                        None => quote!(None),
+                    };
+                    quote!(LetConst { src: #src.to_string(), ty: #ty })
+                }
             };
             quote!(g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
         });
@@ -1005,17 +1018,28 @@ impl Builder {
         }
     }
 
-    /// `let`s of the locals of constants ([`Op::LetConst`], constant [`Op::LetInt`]s), in order.
-    fn const_defs(&self) -> TokenStream {
-        let defs = self.g.nodes.iter().enumerate().filter_map(|(i, n)| {
+    /// `let`s of the locals of constants ([`Op::LetConst`], constant [`Op::LetInt`]s), in order:
+    /// all of them, or those the Rust source `src` reads.
+    fn const_defs(&self, src: Option<&str>) -> TokenStream {
+        let defs: Vec<_> = (self.g.nodes.iter().enumerate())
+            .filter_map(|(i, n)| match &n.op {
+                Op::LetInt(k) if self.const_lets.contains(&format!("p{i}")) => Some((i, Some("usize".to_string()), k.to_string())),
+                Op::LetConst { src, ty } => Some((i, ty.clone(), src.clone())),
+                _ => None,
+            })
+            .collect();
+        // a def reads only earlier ones
+        let mut need = src.map(idents);
+        for (i, _, s) in defs.iter().rev() {
+            if let Some(need) = need.as_mut().filter(|n| n.contains(&format!("p{i}"))) {
+                need.extend(idents(s));
+            }
+        }
+        let defs = defs.iter().filter(|(i, ..)| need.as_ref().is_none_or(|n| n.contains(&format!("p{i}")))).map(|(i, ty, s)| {
             let id = format_ident!("p{i}");
-            let (ty, src) = match &n.op {
-                Op::LetInt(k) if self.const_lets.contains(&id.to_string()) => (quote!(: usize), k.to_string()),
-                Op::LetConst(src) => (quote!(), src.clone()),
-                _ => return None,
-            };
-            let t: TokenStream = src.parse().unwrap();
-            Some(quote!(#[allow(unused_variables)] let #id #ty = #t;))
+            let ty: TokenStream = ty.as_ref().map(|t| format!(": {t}")).unwrap_or_default().parse().unwrap();
+            let t: TokenStream = s.parse().unwrap();
+            quote!(#[allow(unused_variables)] let #id #ty = #t;)
         });
         quote!(#(#defs)*)
     }
@@ -1025,7 +1049,7 @@ impl Builder {
     fn opaque_code<T>(&self, x: &Opaque<T>, ty: TokenStream) -> TokenStream {
         let krate = &self.krate;
         let (src, vars) = (&x.src, &x.vars);
-        let defs = self.const_defs();
+        let defs = self.const_defs(Some(src));
         let t: TokenStream = src.parse().unwrap();
         let binds = vars.iter().enumerate().map(|(k, v)| {
             let id = Ident::new(v, Span::call_site());
@@ -1042,6 +1066,24 @@ impl Builder {
             }
         }
     }
+}
+
+/// The identifiers in the Rust source `src`.
+fn idents(src: &str) -> HashSet<String> {
+    fn walk(ts: TokenStream, out: &mut HashSet<String>) {
+        for tt in ts {
+            match tt {
+                TokenTree::Ident(id) => {
+                    out.insert(id.to_string());
+                }
+                TokenTree::Group(g) => walk(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(src.parse().unwrap(), &mut out);
+    out
 }
 
 /// `v` is or contains a local array.
