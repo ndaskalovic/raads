@@ -77,6 +77,10 @@ fn weight(h: usize) -> f64 {
     h as f64 * 0.1 + 0.3
 }
 
+fn g(h: usize) -> f64 {
+    h as f64 * 0.05 + 0.2
+}
+
 fn damp(w: f64) -> f64 {
     0.1 / (1.0 + w)
 }
@@ -221,6 +225,26 @@ fn shadow_cast<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
     [s]
 }
 
+/// Written types on lets of constants: in tuple and array patterns, kept by an assignment, on a
+/// literal (`f` is the `f32` nearest 0.1, not 0.1); a turbofish; `f64::from`; a function named `g`.
+#[kernel]
+#[allow(clippy::unnecessary_cast)]
+fn typed<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let (ta, tb): (f64, f64) = (W.iter().sum(), 1.5);
+    let [sa, sb]: [f64; 2] = [W.iter().sum(), 0.5];
+    let mut am: f64 = 0.5;
+    let f: f32 = 0.1;
+    let tw = W.iter().sum::<f64>();
+    let u = u32::try_from(IDX[2]).unwrap();
+    let gg = g(3);
+    let mut s = x[0] * (f as f64) * f64::from(u) * am;
+    am = W.iter().sum();
+    for i in 0..2 {
+        s = s * (weight(i) * ta * tb) + x[1] * d[0] * (weight(i) * sa * sb + weight(i) * am * tw) * (weight(i) * gg);
+    }
+    [s]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -319,6 +343,11 @@ fn untyped_constant_locals() {
 #[test]
 fn shadowed_by_loop_variable() {
     check!(shadow_cast, [0.6, 0.9], [0.3], 1);
+}
+
+#[test]
+fn typed_constant_locals() {
+    check!(typed, [0.6, 0.9], [0.3], 1);
 }
 
 #[test]

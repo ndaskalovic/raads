@@ -16,7 +16,8 @@
 //! ([`Opaque`]). A `let` of one becomes a local of the generated code, computed once where it
 //! is defined and read by name: [`Op::LetInt`] for an integer (`let k: usize = ..;`),
 //! [`Op::LetNum`] for an `f64` that reads a loop variable (`let w = weight(h);`), and
-//! [`Op::LetConst`], of the type Rust infers, for constants only (`let n = LAST;`). A plain
+//! [`Op::LetConst`], of the type written or the one Rust infers, for constants only
+//! (`let n = LAST;`, `let a: f32 = 0.1;`). A plain
 //! `f64` that reads only locals of constants is still a constant.
 //!
 //! It also returns the function body rewritten so it compiles for any `N: AdNum`
@@ -108,6 +109,8 @@ pub struct Builder {
     ilocals: HashMap<String, Int>,
     /// Variables of [`Op::LetNum`]s, which are `f64`s (other variables are `usize`).
     num_lets: HashSet<String>,
+    /// The types written for local names (`let a: f32 = ..;`), which their assignments keep.
+    types: HashMap<String, syn::Type>,
     /// Variables of [`Op::LetInt`]s that read no loop variable, directly or through another
     /// let: plain values that read only these are constants.
     const_lets: HashSet<String>,
@@ -133,6 +136,7 @@ impl Builder {
             carried: Vec::new(),
             ilocals: HashMap::new(),
             num_lets: HashSet::new(),
+            types: HashMap::new(),
             const_lets: HashSet::new(),
             n: n.clone(),
             krate: krate.clone(),
@@ -204,6 +208,10 @@ impl Builder {
             return err(span, &format!("`{name}` shadows a loop variable"));
         }
         let v = self.local(v, ty);
+        match ty {
+            Some(t) => self.types.insert(name.clone(), t.clone()),
+            None => self.types.remove(&name),
+        };
         self.params.remove(&name);
         self.ilocals.remove(&name);
         self.env.insert(name, v);
@@ -214,7 +222,14 @@ impl Builder {
     /// here, where the value is defined: not pasted where it is used. One of constants only
     /// keeps the type `ty` or the one Rust infers for it (`let n = LAST;` may be a `usize`).
     fn local(&mut self, v: Val, ty: Option<&syn::Type>) -> Val {
+        let f64_ty = ty.is_none_or(|t| matches!(t, syn::Type::Path(p) if p.path.is_ident("f64")));
         match v {
+            // a literal of another type (`let a: f32 = 0.1;`) is not the `f64` it reads as
+            Val::F(F::Num(k)) if !f64_ty => {
+                let ty = ty.map(|t| t.to_token_stream().to_string());
+                let j = self.push(Op::LetConst { src: format!("({k:?})"), ty }, NONE, NONE, NONE, NONE);
+                Val::F(F::Expr(format_ident!("p{j}").into_token_stream(), vec![]))
+            }
             Val::F(F::Expr(t, vars)) if !self.varies(&vars) => {
                 let ty = ty.map(|t| t.to_token_stream().to_string());
                 let j = self.push(Op::LetConst { src: t.to_string(), ty }, NONE, NONE, NONE, NONE);
@@ -349,7 +364,8 @@ impl Builder {
                     if has_mem(&v) {
                         return err(a.right.span(), "copying a local array is not supported: index it instead");
                     }
-                    self.set(name, v, a.left.span(), None)?;
+                    let ty = self.types.get(&name).cloned();
+                    self.set(name, v, a.left.span(), ty.as_ref())?;
                     let l = &a.left;
                     out.extend(quote!(#l = #e;));
                 }
@@ -525,10 +541,18 @@ impl Builder {
             (Pat::Type(t), v) => self.bind(&t.pat, v, Some(&t.ty)),
             (Pat::Wild(_), _) => Ok(()),
             (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => {
-                t.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, None))
+                let tys: Vec<_> = match ty {
+                    Some(syn::Type::Tuple(tt)) if tt.elems.len() == vs.len() => tt.elems.iter().map(Some).collect(),
+                    _ => vec![None; vs.len()],
+                };
+                t.elems.iter().zip(vs).zip(tys).try_for_each(|((p, v), ty)| self.bind(p, v, ty))
             }
             (Pat::Slice(s), Val::Arr(vs)) if s.elems.len() == vs.len() => {
-                s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, None))
+                let ty = match ty {
+                    Some(syn::Type::Array(a)) => Some(&*a.elem),
+                    _ => None,
+                };
+                s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, ty))
             }
             (p, _) => err(p.span(), "unsupported pattern (use a name, `_`, or a tuple/array of them)"),
         }
@@ -766,14 +790,15 @@ impl Builder {
                 _ => unreachable!(),
             });
             let sa = ats.iter().zip(&m.args).map(|(t, a)| if is_literal(a) { a.to_token_stream() } else { t.clone() });
-            let src = quote!(#rt.#meth(#(#sa),*));
+            let tf = &m.turbofish;
+            let src = quote!(#rt.#meth #tf (#(#sa),*));
             let mut vars = f.vars().to_vec();
             for a in &args {
                 if let Val::F(x) = a {
                     add_vars(&mut vars, x.vars());
                 }
             }
-            return Ok((Val::F(F::Expr(quote!(#ft.#meth(#(#fa),*)), vars)), src));
+            return Ok((Val::F(F::Expr(quote!(#ft.#meth #tf (#(#fa),*)), vars)), src));
         }
         let mut src = quote!(#rt.#meth(#(#ats),*));
         let x = self.node(&recv, m.receiver.span())?;
@@ -861,8 +886,9 @@ impl Builder {
         let Expr::Path(p) = &*c.func else { return err(sp, "unsupported call in a kernel") };
         let last = p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
         let f = &c.func;
-        if last != "select_gt" && last != "from" {
-            // a plain Rust function (`weight(h)`)
+        let f64_from = p.path.segments.len() == 2 && p.path.segments[0].ident == "f64";
+        if last != "select_gt" && (last != "from" || f64_from) {
+            // a plain Rust function (`weight(h)`, `f64::from(n)`)
             let (t, vars) = self.plain(c)?;
             return Ok((Val::F(F::Expr(t, vars)), c.to_token_stream()));
         }
@@ -989,15 +1015,15 @@ impl Builder {
                     quote!(LetConst { src: #src.to_string(), ty: #ty })
                 }
             };
-            quote!(g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
+            quote!(__raads_g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
         });
         let outs = &self.g.outs;
         quote! {
             #lets
-            let mut g = #krate::__private::codegen::Graph::default();
+            let mut __raads_g = #krate::__private::codegen::Graph::default();
             #(#nodes)*
-            g.outs = vec![#(#outs),*];
-            g
+            __raads_g.outs = vec![#(#outs),*];
+            __raads_g
         }
     }
 
