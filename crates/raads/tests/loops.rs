@@ -176,6 +176,24 @@ fn constants<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
     [s]
 }
 
+/// Untyped lets of constants keep their Rust type (`n`, `k`, `j` are `usize`s), and `as f64`
+/// of an `f64` local.
+#[kernel]
+#[allow(clippy::unnecessary_cast)]
+fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
+    let n = IDX[2] - IDX[3];
+    let k = IDX[0];
+    let m: usize = 1;
+    let j = IDX[m];
+    let a = weight(1);
+    let mut s = x[n] * weight(k) + x[j] * (a as f64);
+    for i in 0..2 {
+        let w = weight(i + k);
+        s = s * (w as f64) + x[n - i] * d[0];
+    }
+    [s]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -264,6 +282,11 @@ fn chained_locals() {
 #[test]
 fn constant_locals() {
     check!(constants, [0.6, 1.3], [0.3], 1);
+}
+
+#[test]
+fn untyped_constant_locals() {
+    check!(untyped, [0.6, -0.4, 1.1], [0.3], 1);
 }
 
 #[test]

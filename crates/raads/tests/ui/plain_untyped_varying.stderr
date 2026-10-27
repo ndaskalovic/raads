@@ -1,0 +1,69 @@
+error[E0308]: mismatched types
+  --> tests/ui/plain_untyped_varying.rs:13:17
+   |
+13 |         let k = IDX[i];
+   |             -   ^^^^^^ expected `f64`, found `usize`
+   |             |
+   |             expected due to this
+   |
+help: you can cast a `usize` to an `f64`, producing the floating point representation of the integer, rounded if necessary
+   |
+13 |         let k = IDX[i] as f64;
+   |                        ++++++
+
+error[E0308]: mismatched types
+  --> tests/ui/plain_untyped_varying.rs:14:24
+   |
+14 |         s = s * weight(k);
+   |                 ------ ^ expected `usize`, found `f64`
+   |                 |
+   |                 arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/ui/plain_untyped_varying.rs:5:4
+   |
+ 5 | fn weight(h: usize) -> f64 {
+   |    ^^^^^^ --------
+
+error[E0308]: mismatched types
+ --> tests/ui/plain_untyped_varying.rs:9:1
+  |
+9 | #[kernel]
+  | ^^^^^^^^^ expected `f64`, found `usize`
+  |
+  = note: this error originates in the attribute macro `kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can cast a `usize` to an `f64`, producing the floating point representation of the integer, rounded if necessary
+  |
+9 | #[kernel] as f64
+  |           ++++++
+
+error[E0308]: mismatched types
+ --> tests/ui/plain_untyped_varying.rs:9:1
+  |
+9 | #[kernel]
+  | ^^^^^^^^^
+  | |
+  | expected `usize`, found `f64`
+  | arguments to this function are incorrect
+  |
+note: function defined here
+ --> tests/ui/plain_untyped_varying.rs:5:4
+  |
+5 | fn weight(h: usize) -> f64 {
+  |    ^^^^^^ --------
+  = note: this error originates in the attribute macro `kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+ --> tests/ui/plain_untyped_varying.rs:9:1
+  |
+9 | #[kernel]
+  | ^^^^^^^^^
+  | |
+  | expected `f64`, found `usize`
+  | expected `f64` because of return type
+  |
+  = note: this error originates in the attribute macro `kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can cast a `usize` to an `f64`, producing the floating point representation of the integer, rounded if necessary
+  |
+9 | #[kernel] as f64
+  |           ++++++
