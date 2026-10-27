@@ -98,7 +98,7 @@ pub fn live(g: &Graph) -> Vec<bool> {
         for i in (0..g.len()).rev() {
             let n = &g.nodes[i];
             let keep = match n.op {
-                Op::Loop(..) | Op::End | Op::LetInt(_) | Op::LetNum(_) => true,
+                Op::Loop(..) | Op::End | Op::LetInt(_) | Op::LetNum(_) | Op::LetConst(_) => true,
                 Op::Next | Op::Store(_) => l[n.a],
                 _ => l[i],
             };
@@ -247,7 +247,7 @@ impl Analysis {
     /// The reverse sweep recomputes node `i` where its scope starts (see [`Self::rematerialised`]).
     pub fn recomputed(&self, g: &Graph, i: usize, inputs: bool) -> bool {
         match g.nodes[i].op {
-            Op::LetInt(_) | Op::LetNum(_) => true,
+            Op::LetInt(_) | Op::LetNum(_) | Op::LetConst(_) => true,
             Op::Param { .. } | Op::Num(_) => self.reads[i] && remat(g, i, inputs),
             _ => false,
         }

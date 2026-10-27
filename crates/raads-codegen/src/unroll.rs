@@ -68,6 +68,8 @@ impl Unroll<'_> {
                 }
                 Op::LetInt(idx) => vars.push((format!("p{i}"), idx.eval(vars).expect("integer") as f64)),
                 Op::LetNum(x) => vars.push((format!("p{i}"), x.call(vars).expect("number"))),
+                // plain Rust that reads it recomputes it
+                Op::LetConst(_) => {}
                 Op::Num(x) => {
                     let k = x.call(vars).expect("number");
                     self.map[i] = self.out.push(Op::Const(crate::f64_literal(k)), NONE, NONE, NONE, NONE);

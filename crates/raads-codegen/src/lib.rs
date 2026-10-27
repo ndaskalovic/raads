@@ -80,6 +80,9 @@ pub enum Op {
     /// `let p<i>: f64 = ..;`: a plain Rust `f64` local of the loop variables, computed once
     /// where it is defined; plain Rust expressions read it as `p<i>`.
     LetNum(Opaque<f64>),
+    /// `let p<i> = ..;`: a plain Rust local of constants only (`let n = LAST;`), computed once
+    /// where it is defined, of the type Rust infers; plain Rust expressions read it as `p<i>`.
+    LetConst(String),
     /// Element `idx` of an array parameter.
     Param {
         /// Input (or data) number of element 0.

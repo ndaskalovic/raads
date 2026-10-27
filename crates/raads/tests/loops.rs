@@ -176,8 +176,8 @@ fn constants<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
     [s]
 }
 
-/// Untyped lets of constants keep their Rust type (`n`, `k`, `j` are `usize`s), and `as f64`
-/// of an `f64` local.
+/// Untyped lets of constants keep their Rust type (`n`, `k`, `j`, `n2`, `k3`, `t`, `c` are
+/// `usize`s), and `as f64` of an `f64` local.
 #[kernel]
 #[allow(clippy::unnecessary_cast)]
 fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
@@ -186,10 +186,36 @@ fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
     let m: usize = 1;
     let j = IDX[m];
     let a = weight(1);
-    let mut s = x[n] * weight(k) + x[j] * (a as f64);
+    let n2 = n;
+    let k3 = IDX[n2 - 1];
+    let (t, b) = (LAST, a * 2.0);
+    let c = pick(3);
+    let mut s = x[n] * weight(k) + x[j] * (a as f64) + x[k3] * (t as f64) * b * ((a) as f64);
     for i in 0..2 {
         let w = weight(i + k);
-        s = s * (w as f64) + x[n - i] * d[0];
+        s = s * (w as f64) * ((w * 2.0) as f64) + x[n - i] * d[0];
+        for pick in 0..2 {
+            s = s + x[pick] * (c as f64);
+        }
+    }
+    [s]
+}
+
+/// Loop variables that shadow plain locals, read with `as f64`.
+#[kernel]
+fn shadow_cast<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let i = 0.5;
+    let n = weight(2) * 2.0;
+    let mut s = x[0] * i * n;
+    for i in 0..3 {
+        let w = i as f64 + 0.5;
+        s = s + x[1] * (i as f64) * d[0];
+        for w in 0..2 {
+            s = s + x[0] * (w as f64) * d[0];
+        }
+        for n in 0..2 {
+            s = s * w + x[0] * (n as f64);
+        }
     }
     [s]
 }
@@ -287,6 +313,11 @@ fn constant_locals() {
 #[test]
 fn untyped_constant_locals() {
     check!(untyped, [0.6, -0.4, 1.1], [0.3], 1);
+}
+
+#[test]
+fn shadowed_by_loop_variable() {
+    check!(shadow_cast, [0.6, 0.9], [0.3], 1);
 }
 
 #[test]
