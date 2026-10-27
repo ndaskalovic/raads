@@ -4,18 +4,20 @@
 
 ![Benchmark chart](ad-benchmarks/chart.png)
 
-The Heston MC, SABR calibration and LIBOR swaption workloads of [auto-differentiation/ad-benchmarks](https://github.com/auto-differentiation/ad-benchmarks), the suite in [XAD's README](https://github.com/auto-differentiation/xad#benchmarks), with raads added. Gradient time; Primal is the same workload in plain C++ doubles (the dashed line).
+The Heston MC, SABR calibration, XVA and LIBOR swaption workloads of [auto-differentiation/ad-benchmarks](https://github.com/auto-differentiation/ad-benchmarks), the suite in [XAD's README](https://github.com/auto-differentiation/xad#benchmarks), with raads added. Gradient time; the primals are the same workload without AD (the dashed lines): the suite's code on C++ doubles, and raads's kernels called as plain Rust functions on `f64`.
 
-| # | Benchmark | Sensis | Primal | FD | XAD | Adept | autodiff | raads | raads SIMD |
-|---|---|:-:|--:|--:|--:|--:|--:|--:|--:|
-| 1 | Heston MC | 8 | 5.19 ms | 46.6 ms | 45.4 ms | 68.6 ms | DNF | 17.1 ms | **2.56 ms** |
-| 2 | SABR Calib | 15 | 0.848 ms | 13.6 ms | 6.79 ms | 13.8 ms | 17.5 ms | 0.926 ms | **0.772 ms** |
-| 4 | LIBOR Swaption | 161 | 50.2 ms | 7.57 s | 841 ms | 924 ms | DNF | 127 ms | **55.6 ms** |
+| # | Benchmark | Sensis | C++ primal | Rust primal | FD | XAD | Adept | autodiff | raads | raads SIMD |
+|---|---|:-:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | Heston MC | 8 | 5.17 ms | 6.38 ms | 46.3 ms | 44.9 ms | 67.7 ms | DNF | 17.5 ms | **2.54 ms** |
+| 2 | SABR Calib | 15 | 0.852 ms | 0.579 ms | 13.5 ms | 6.81 ms | 13.7 ms | 17.8 ms | 0.924 ms | **0.773 ms** |
+| 3 | XVA CVA | 40 | 242 ms | 244 ms | 9.81 s | 1.64 s | 5.20 s | DNF | 410 ms | **97.3 ms** |
+| 4 | LIBOR Swaption | 161 | 50.0 ms | 51.3 ms | 7.53 s | 841 ms | 916 ms | DNF | 129 ms | **55.2 ms** |
 
-- Same inputs, sizes and timing as the suite: its own code generates the random numbers and market data ([`ad-benchmarks/reference.cpp`](ad-benchmarks/reference.cpp)), median of 10 runs after 3 warm-ups, f64, single core. raads's values and gradients match XAD's to 1e-9.
-- raads runs the suite's kernels ported line by line ([`src/bin/adbench.rs`](src/bin/adbench.rs)): Heston as a path model, the SABR objective as a kernel over strikes, LIBOR as one kernel per path with its loops. raads: 1 lane; raads SIMD: 8 lanes (Heston), 4 (SABR, LIBOR).
-- The suite's LIBOR timings include drawing the normals inside the timed loop; raads reads them pre-drawn. Drawing them costs 5.1 ms, under 1% of XAD's time.
-- Apple M5, Apple clang 17. Differences from the suite's published run (Xeon, GCC 13, `-O3 -mavx2 -mfma`): `-mcpu=native` on ARM; CppAD left out (its build needs pkg-config); XAD-Codegen is commercial. XVA is not ported yet: it needs array indices computed from times.
+- Same inputs, sizes and timing as the suite: its own code generates the random numbers and market data ([`ad-benchmarks/reference.cpp`](ad-benchmarks/reference.cpp)), median of 10 runs after 3 warm-ups, f64, single core. raads's values and gradients match XAD's to 1e-9, except two XVA gradients (below).
+- raads runs the suite's kernels ported line by line ([`src/bin/adbench.rs`](src/bin/adbench.rs)): Heston as a path model, the SABR objective as a kernel over strikes, LIBOR and XVA as one kernel per path with their loops, XVA's curve lookups (interval and weight of a time) in plain Rust. raads: 1 lane; raads SIMD: 8 lanes (Heston), 4 (SABR, LIBOR), 16 (XVA).
+- XVA: two of the 40 gradients, d/d `rates[10]` and d/d `vols[0]`, are not checked, because f64 can't compute them. On a few paths the suite's CVA explodes (up to 3e45; the average is 3e41), and on those paths rounding error swamps these two gradients. Reverse and forward mode of the same raads kernel give values 30% apart for them (`adbench` prints both), and XAD gives a third.
+- The suite's LIBOR timings, its primal's included, draw the normals inside the timed loop; raads reads them pre-drawn. Drawing them costs 5.1 ms: under 1% of XAD's time, a tenth of the C++ primal's.
+- Apple M5, Apple clang 17. Differences from the suite's published run (Xeon, GCC 13, `-O3 -mavx2 -mfma`): `-mcpu=native` on ARM; CppAD left out (its build needs pkg-config); XAD-Codegen is commercial.
 - Versions: ad-benchmarks c8439f9, XAD 9c33936, Adept d0a7751, autodiff b0a4fef.
 
 Reproduce, from the repository root:

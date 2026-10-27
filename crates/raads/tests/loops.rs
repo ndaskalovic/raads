@@ -65,6 +65,186 @@ fn misc<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 3] {
     a
 }
 
+const LAST: usize = 4;
+const IDX: [usize; 4] = [2, 0, 3, 1];
+const W: [f64; 4] = [0.5, -1.0, 2.0, 0.25];
+
+fn pick(h: usize) -> usize {
+    h / 2
+}
+
+fn weight(h: usize) -> f64 {
+    h as f64 * 0.1 + 0.3
+}
+
+fn g(h: usize) -> f64 {
+    h as f64 * 0.05 + 0.2
+}
+
+fn damp(w: f64) -> f64 {
+    0.1 / (1.0 + w)
+}
+
+/// Plain Rust indices and numbers: const arrays, functions, integer locals (one used in an
+/// inner loop), a plain f64 local passed to a function, and computed indices at the top level
+/// (an input and a data element).
+#[kernel]
+fn plain<N: AdNum>(x: [N; 5], #[data] d: [N; 4]) -> [N; 2] {
+    let last: usize = LAST;
+    let mut a = [x[0]; 4];
+    let mut s = x[last] * d[IDX[0]];
+    for i in 0..4 {
+        let k: usize = IDX[i];
+        let w = weight(i + 1);
+        a[k] = a[k] * x[pick(i + 2)] + w * W[i] * d[k];
+        s = s + (1.0 - w) * a[IDX[3 - i]] + (k as f64) * x[k + 1];
+        for j in 0..i {
+            s = s * (W[j] * weight(k + j) * damp(w)).exp() + x[pick(j + k)] * d[(j + k) % 4];
+        }
+    }
+    [s, a[pick(LAST - 1)]]
+}
+
+/// An inner loop variable that shadows an outer one: plain locals keep the outer value.
+#[kernel]
+fn shadowed<N: AdNum>(x: [N; 4], #[data] d: [N; 1]) -> [N; 1] {
+    let mut s = N::from(0.0);
+    for i in 0..2 {
+        let k: usize = i;
+        let w = i as f64;
+        for i in 0..2 {
+            s = s + w * x[i] + x[k + 2] * (i as f64 + 1.0);
+        }
+    }
+    [s * d[0]]
+}
+
+/// A chain of plain locals, each read several times: each is computed once, so the
+/// expansion grows linearly with the chain.
+#[kernel]
+fn locals<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let mut s = x[0];
+    for i in 0..3 {
+        let a0 = i as f64 * 0.25 + 1.0;
+        let a1 = a0 * a0 - a0 * 0.5;
+        let a2 = a1 * a1 - a1 * 0.5;
+        let a3 = a2 * a2 - a2 * 0.5;
+        let a4 = a3 * a3 - a3 * 0.5;
+        let a5 = a4 * a4 - a4 * 0.5;
+        let a6 = a5 * a5 - a5 * 0.5;
+        let a7 = a6 * a6 - a6 * 0.5;
+        let a8 = a7 * a7 - a7 * 0.5;
+        let a9 = a8 * a8 - a8 * 0.5;
+        let a10 = a9 * a9 - a9 * 0.5;
+        let a11 = a10 * a10 - a10 * 0.5;
+        let a12 = a11 * a11 - a11 * 0.5;
+        let a13 = a12 * a12 - a12 * 0.5;
+        let a14 = a13 * a13 - a13 * 0.5;
+        let a15 = a14 * a14 - a14 * 0.5;
+        let a16 = a15 * a15 - a15 * 0.5;
+        let k0: usize = i % 2;
+        let k1: usize = k0 * k0 + k0 - k0;
+        s = s * (a16 + 1.0) + x[k1] * d[0] * a8;
+    }
+    [s]
+}
+
+/// Constant plain locals: a chain, each read several times (computed once, so the expansion
+/// grows linearly with the chain), and `powf` exponents from constant `f64` and `usize` locals.
+#[kernel]
+fn constants<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let a0 = weight(5);
+    let a1 = a0 * a0 - a0 * 0.5;
+    let a2 = a1 * a1 - a1 * 0.5;
+    let a3 = a2 * a2 - a2 * 0.5;
+    let a4 = a3 * a3 - a3 * 0.5;
+    let a5 = a4 * a4 - a4 * 0.5;
+    let a6 = a5 * a5 - a5 * 0.5;
+    let a7 = a6 * a6 - a6 * 0.5;
+    let a8 = a7 * a7 - a7 * 0.5;
+    let a9 = a8 * a8 - a8 * 0.5;
+    let a10 = a9 * a9 - a9 * 0.5;
+    let a11 = a10 * a10 - a10 * 0.5;
+    let a12 = a11 * a11 - a11 * 0.5;
+    let a13 = a12 * a12 - a12 * 0.5;
+    let a14 = a13 * a13 - a13 * 0.5;
+    let a15 = a14 * a14 - a14 * 0.5;
+    let a16 = a15 * a15 - a15 * 0.5;
+    let e = W[2] - 0.5;
+    let k: usize = IDX[0];
+    let mut s = x[0].powf(e) * a16 + x[1].powf(k as f64);
+    for i in 0..3 {
+        let b = a8 * weight(LAST);
+        s = s * x[1].powf(e + b) + d[0] * (i as f64) * a16 + x[0].powf(k as f64 + 1.0);
+    }
+    [s]
+}
+
+/// Lets of constants keep their Rust type (`n`, `k`, `j`, `n2`, `k3`, `t`, `c` are
+/// `usize`s) or the one written (`ws`), and `as f64` of an `f64` local.
+#[kernel]
+#[allow(clippy::unnecessary_cast)]
+fn untyped<N: AdNum>(x: [N; 3], #[data] d: [N; 1]) -> [N; 1] {
+    let n = IDX[2] - IDX[3];
+    let k = IDX[0];
+    let m: usize = 1;
+    let j = IDX[m];
+    let a = weight(1);
+    let n2 = n;
+    let k3 = IDX[n2 - 1];
+    let (t, b) = (LAST, a * 2.0);
+    let c = pick(3);
+    let ws: f64 = W.iter().sum();
+    let mut s = x[n] * ws * weight(k) + x[j] * (a as f64) + x[k3] * (t as f64) * b * ((a) as f64);
+    for i in 0..2 {
+        let w = weight(i + k);
+        s = s * (w as f64) * ((w * 2.0) as f64) + x[n - i] * d[0] * (weight(i) * ws);
+        for pick in 0..2 {
+            s = s + x[pick] * (c as f64);
+        }
+    }
+    [s]
+}
+
+/// Loop variables that shadow plain locals, read with `as f64`.
+#[kernel]
+fn shadow_cast<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let i = 0.5;
+    let n = weight(2) * 2.0;
+    let mut s = x[0] * i * n;
+    for i in 0..3 {
+        let w = i as f64 + 0.5;
+        s = s + x[1] * (i as f64) * d[0];
+        for w in 0..2 {
+            s = s + x[0] * (w as f64) * d[0];
+        }
+        for n in 0..2 {
+            s = s * w + x[0] * (n as f64);
+        }
+    }
+    [s]
+}
+
+/// Written types on lets of constants: in tuple and array patterns, kept by an assignment, on a
+/// literal (`f` is the `f32` nearest 0.1, not 0.1); a turbofish; `f64::from`; a function named `g`.
+#[kernel]
+#[allow(clippy::unnecessary_cast)]
+fn typed<N: AdNum>(x: [N; 2], #[data] d: [N; 1]) -> [N; 1] {
+    let (ta, tb): (f64, f64) = (W.iter().sum(), 1.5);
+    let [sa, sb]: [f64; 2] = [W.iter().sum(), 0.5];
+    let mut am: f64 = 0.5;
+    let f: f32 = 0.1;
+    let tw = W.iter().sum::<f64>();
+    let u = u32::try_from(IDX[2]).unwrap();
+    let gg = g(3);
+    let mut s = x[0] * (f as f64) * f64::from(u) * am;
+    am = W.iter().sum();
+    for i in 0..2 {
+        s = s * (weight(i) * ta * tb) + x[1] * d[0] * (weight(i) * sa * sb + weight(i) * am * tw) * (weight(i) * gg);
+    }
+    [s]
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol * (1.0 + b.abs())
 }
@@ -133,6 +313,41 @@ fn carried_sum() {
 #[test]
 fn triangular_nest() {
     check!(triangle, [0.05, 0.05, 0.06, 0.04, 0.055, 0.2, 0.25, 0.18], [0.3, -1.2, 0.7], 2);
+}
+
+#[test]
+fn plain_rust() {
+    check!(plain, [0.4, 0.9, 1.3, -0.2, 0.7], [0.5, -0.8, 1.1, 0.3], 2);
+}
+
+#[test]
+fn shadowed_loop_variable() {
+    check!(shadowed, [1.0, 2.0, 3.0, 5.0], [0.7], 1);
+}
+
+#[test]
+fn chained_locals() {
+    check!(locals, [0.6, -0.4], [0.3], 1);
+}
+
+#[test]
+fn constant_locals() {
+    check!(constants, [0.6, 1.3], [0.3], 1);
+}
+
+#[test]
+fn untyped_constant_locals() {
+    check!(untyped, [0.6, -0.4, 1.1], [0.3], 1);
+}
+
+#[test]
+fn shadowed_by_loop_variable() {
+    check!(shadow_cast, [0.6, 0.9], [0.3], 1);
+}
+
+#[test]
+fn typed_constant_locals() {
+    check!(typed, [0.6, 0.9], [0.3], 1);
 }
 
 #[test]

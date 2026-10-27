@@ -9,16 +9,24 @@
 //! Loops are not unrolled: a `for` loop becomes a [`Op::Loop`] marker, its body (traced
 //! once, with the loop variable symbolic), an [`Op::End`], and a carried value
 //! ([`Op::Phi`], [`Op::Next`], [`Op::Out`]) for every outer variable the body assigns.
-//! Arrays written with a loop-dependent index are local arrays (`let mut a = [x; LEN]`) or
+//! Arrays written with a loop-dependent index are local arrays (`let mut a = [x; 8]`) or
 //! array parameters, read and written through [`Op::Load`], [`Op::Store`], [`Op::Param`].
+//! Indices the macro cannot evaluate (`MATURITIES[i]`, `interval(h)`) and plain `f64`
+//! expressions of loop variables (`i as f64`, `weight(h)`) stay Rust source
+//! ([`Opaque`]). A `let` of one becomes a local of the generated code, computed once where it
+//! is defined and read by name: [`Op::LetInt`] for an integer (`let k: usize = ..;`),
+//! [`Op::LetNum`] for an `f64` that reads a loop variable (`let w = weight(h);`), and
+//! [`Op::LetConst`], of the type written or the one Rust infers, for constants only
+//! (`let n = LAST;`, `let a: f32 = 0.1;`). A plain
+//! `f64` that reads only locals of constants is still a constant.
 //!
 //! It also returns the function body rewritten so it compiles for any `N: AdNum`
 //! (`2 * x` becomes `x.rmul(2f64)`, `x.maximum(0.0)` becomes `x.maximum(N::from(0.0))`),
 //! which is the eager / tracer version of the kernel.
 
-use proc_macro2::{Ident, Literal, Span, TokenStream};
-use quote::{ToTokens, quote, quote_spanned};
-use raads_codegen::{Graph, Int, NONE, Op, f64_literal};
+use proc_macro2::{Ident, Literal, Span, TokenStream, TokenTree};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
+use raads_codegen::{Graph, Int, NONE, Op, Opaque, f64_literal};
 use std::collections::{HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::{BinOp, Error, Expr, Lit, Pat, Result, Stmt, UnOp};
@@ -27,7 +35,10 @@ use syn::{BinOp, Error, Expr, Lit, Pat, Result, Stmt, UnOp};
 #[derive(Clone, Debug)]
 pub enum F {
     Num(f64),
-    Expr(TokenStream),
+    /// Rust source for the generated code and the loop variables and locals it reads. One
+    /// that reads loop variables, or locals computed from them, becomes an [`Op::Num`] node
+    /// where a number is needed, not a constant.
+    Expr(TokenStream, Vec<String>),
 }
 
 impl F {
@@ -35,7 +46,14 @@ impl F {
     pub fn source(&self) -> String {
         match self {
             F::Num(k) => f64_literal(*k),
-            F::Expr(t) => format!("({t})"),
+            F::Expr(t, _) => format!("({t})"),
+        }
+    }
+    /// Loop variables and locals the value reads.
+    fn vars(&self) -> &[String] {
+        match self {
+            F::Num(_) => &[],
+            F::Expr(_, v) => v,
         }
     }
     /// Source as tokens that are safe in any position, including a method receiver
@@ -86,6 +104,16 @@ pub struct Builder {
     elems: HashMap<(usize, String), usize>,
     /// Variables the innermost loop carries to its next iteration.
     carried: Vec<String>,
+    /// Integer locals (`let k: usize = ..;`): a literal, or the variable of their
+    /// [`Op::LetInt`].
+    ilocals: HashMap<String, Int>,
+    /// Variables of [`Op::LetNum`]s, which are `f64`s (other variables are `usize`).
+    num_lets: HashSet<String>,
+    /// The types written for local names (`let a: f32 = ..;`), which their assignments keep.
+    types: HashMap<String, syn::Type>,
+    /// Variables of [`Op::LetInt`]s that read no loop variable, directly or through another
+    /// let: plain values that read only these are constants.
+    const_lets: HashSet<String>,
     /// The kernel's number type parameter and the path of `raads`.
     n: Ident,
     krate: TokenStream,
@@ -106,6 +134,10 @@ impl Builder {
             ints: Vec::new(),
             elems: HashMap::new(),
             carried: Vec::new(),
+            ilocals: HashMap::new(),
+            num_lets: HashSet::new(),
+            types: HashMap::new(),
+            const_lets: HashSet::new(),
             n: n.clone(),
             krate: krate.clone(),
         };
@@ -135,8 +167,28 @@ impl Builder {
         self.g.push(op, a, b, c, d)
     }
 
+    /// `vars` include a loop variable, or a let computed from one.
+    fn varies(&self, vars: &[String]) -> bool {
+        vars.iter().any(|v| !self.const_lets.contains(v))
+    }
+
+    /// `v` is the value of an [`Op::LetNum`].
+    fn num_let(&self, v: &Val) -> bool {
+        matches!(v, Val::F(F::Expr(_, vars)) if vars.iter().any(|x| self.num_lets.contains(x)))
+    }
+
+    /// `v` is a plain `f64`: a number or the value of an [`Op::LetNum`] (an
+    /// [`Op::LetConst`] may have any type).
+    fn f64_local(&self, v: &Val) -> bool {
+        matches!(v, Val::F(F::Num(_))) || self.num_let(v)
+    }
+
     fn konst(&mut self, f: &F) -> usize {
-        let i = self.push(Op::Const(f.source()), NONE, NONE, NONE, NONE);
+        let op = match self.varies(f.vars()) {
+            false => Op::Const(f.source()),
+            true => Op::Num(Opaque { src: f.source(), vars: f.vars().to_vec(), eval: None }),
+        };
+        let i = self.push(op, NONE, NONE, NONE, NONE);
         self.consts[i] = Some(f.clone());
         i
     }
@@ -149,14 +201,49 @@ impl Builder {
         }
     }
 
-    /// Bind `name` (a `let` or an assignment); it no longer names an array parameter.
-    fn set(&mut self, name: String, v: Val, span: Span) -> Result<()> {
+    /// Bind `name` (a `let`, with the type `ty` the user wrote, or an assignment); it no
+    /// longer names an array parameter.
+    fn set(&mut self, name: String, v: Val, span: Span, ty: Option<&syn::Type>) -> Result<()> {
         if self.ints.contains(&name) {
             return err(span, &format!("`{name}` shadows a loop variable"));
         }
+        let v = self.local(v, ty);
+        match ty {
+            Some(t) => self.types.insert(name.clone(), t.clone()),
+            None => self.types.remove(&name),
+        };
         self.params.remove(&name);
+        self.ilocals.remove(&name);
         self.env.insert(name, v);
         Ok(())
+    }
+
+    /// `v` with each plain expression replaced by a local of the generated code, computed
+    /// here, where the value is defined: not pasted where it is used. One of constants only
+    /// keeps the type `ty` or the one Rust infers for it (`let n = LAST;` may be a `usize`).
+    fn local(&mut self, v: Val, ty: Option<&syn::Type>) -> Val {
+        let f64_ty = ty.is_none_or(|t| matches!(t, syn::Type::Path(p) if p.path.is_ident("f64")));
+        match v {
+            // a literal of another type (`let a: f32 = 0.1;`) is not the `f64` it reads as
+            Val::F(F::Num(k)) if !f64_ty => {
+                let ty = ty.map(|t| t.to_token_stream().to_string());
+                let j = self.push(Op::LetConst { src: format!("({k:?})"), ty }, NONE, NONE, NONE, NONE);
+                Val::F(F::Expr(format_ident!("p{j}").into_token_stream(), vec![]))
+            }
+            Val::F(F::Expr(t, vars)) if !self.varies(&vars) => {
+                let ty = ty.map(|t| t.to_token_stream().to_string());
+                let j = self.push(Op::LetConst { src: t.to_string(), ty }, NONE, NONE, NONE, NONE);
+                Val::F(F::Expr(format_ident!("p{j}").into_token_stream(), vec![]))
+            }
+            Val::F(F::Expr(t, vars)) => {
+                let j = self.push(Op::LetNum(Opaque { src: t.to_string(), vars, eval: None }), NONE, NONE, NONE, NONE);
+                let name = format!("p{j}");
+                self.num_lets.insert(name.clone());
+                Val::F(F::Expr(name.parse().unwrap(), vec![name]))
+            }
+            Val::Arr(vs) => Val::Arr(vs.into_iter().map(|v| self.local(v, None)).collect()),
+            v => v,
+        }
     }
 
     /// Rewritten source `t` of `v` where an `N` is expected: plain `f64`s become `N::from(t)`
@@ -194,6 +281,37 @@ impl Builder {
         let mut out = TokenStream::new();
         for st in stmts {
             match st {
+                Stmt::Local(l) if usize_name(&l.pat).is_some() => {
+                    let id = usize_name(&l.pat).unwrap();
+                    let name = id.to_string();
+                    let Some(init) = l.init.as_ref().filter(|i| i.diverge.is_none()) else {
+                        return err(l.span(), "`let` needs a value");
+                    };
+                    if self.ints.contains(&name) {
+                        return err(id.span(), &format!("`{name}` shadows a loop variable"));
+                    }
+                    if self.carried.contains(&name) {
+                        return err(
+                            id.span(),
+                            &format!("`{name}` is carried to the next iteration: a `let` here would hide it, use another name"),
+                        );
+                    }
+                    let k = match self.int(&init.expr)? {
+                        Int::Lit(k) => Int::Lit(k),
+                        k => {
+                            let fixed = !self.varies(&k.vars());
+                            let var = format!("p{}", self.push(Op::LetInt(k), NONE, NONE, NONE, NONE));
+                            if fixed {
+                                self.const_lets.insert(var.clone());
+                            }
+                            Int::Var(var)
+                        }
+                    };
+                    self.env.remove(&name);
+                    self.params.remove(&name);
+                    self.ilocals.insert(name, k);
+                    out.extend(l.to_token_stream());
+                }
                 Stmt::Local(l) => {
                     let init = l.init.as_ref().ok_or_else(|| Error::new(l.span(), "`let` needs a value"))?;
                     if init.diverge.is_some() {
@@ -203,15 +321,23 @@ impl Builder {
                     if has_mem(&v) && !matches!(&*init.expr, Expr::Repeat(_)) {
                         return err(init.expr.span(), "copying a local array is not supported: index it instead");
                     }
-                    self.bind(&l.pat, v)?;
+                    self.bind(&l.pat, v, None)?;
+                    // an `f64` local is an `f64` in the rewritten source too, so a type error
+                    // points at the `let`
                     let pat = &l.pat;
-                    out.extend(quote_spanned!(l.span()=> let #pat = #e;));
+                    let ty = match pat {
+                        Pat::Ident(p) if self.env.get(&p.ident.to_string()).is_some_and(|v| self.num_let(v)) => {
+                            quote_spanned!(p.span()=> : f64)
+                        }
+                        _ => quote!(),
+                    };
+                    out.extend(quote_spanned!(l.span()=> let #pat #ty = #e;));
                 }
                 Stmt::Expr(Expr::Assign(a), _) if matches!(&*a.left, Expr::Index(_)) => {
                     let Expr::Index(ix) = &*a.left else { unreachable!() };
                     let name = ident_of(&ix.expr)?;
                     let Some(&Val::Mem(m)) = self.env.get(&name) else {
-                        return err(ix.expr.span(), "only local arrays (`let mut a = [x; LEN];`) can be assigned by element");
+                        return err(ix.expr.span(), "only local arrays (`let mut a = [x; 8];`) can be assigned by element");
                     };
                     let idx = self.int(&ix.index)?;
                     let (v, e) = self.expr(&a.right)?;
@@ -226,6 +352,9 @@ impl Builder {
                 }
                 Stmt::Expr(Expr::Assign(a), _) => {
                     let name = ident_of(&a.left)?;
+                    if self.ilocals.contains_key(&name) {
+                        return err(a.left.span(), &format!("`{name}` is a `usize` local: kernels do not reassign integers"));
+                    }
                     match self.env.get(&name) {
                         None => return err(a.left.span(), &format!("unknown variable `{name}`")),
                         Some(Val::Mem(_)) => return err(a.left.span(), "a local array is assigned by element: `a[i] = x;`"),
@@ -235,7 +364,8 @@ impl Builder {
                     if has_mem(&v) {
                         return err(a.right.span(), "copying a local array is not supported: index it instead");
                     }
-                    self.set(name, v, a.left.span())?;
+                    let ty = self.types.get(&name).cloned();
+                    self.set(name, v, a.left.span(), ty.as_ref())?;
                     let l = &a.left;
                     out.extend(quote!(#l = #e;));
                 }
@@ -259,6 +389,13 @@ impl Builder {
             return err(r.span(), "a kernel loop runs over a range `lo..hi`");
         };
         let (lo, hi) = (self.int(start)?, self.int(end)?);
+        let loop_vars_only = |b: &Int| !b.has_opaque() && b.vars().iter().all(|v| self.ints.contains(v));
+        if !loop_vars_only(&lo) || !loop_vars_only(&hi) {
+            return err(
+                r.span(),
+                "loop bounds are integer literals, loop variables and `+ - * / %` of them (the macro sizes the tape from them)",
+            );
+        }
         let mut carried = Vec::new();
         assigned(&f.body.stmts, &mut HashSet::new(), &mut carried);
         carried.retain(|name| self.env.contains_key(name));
@@ -271,7 +408,7 @@ impl Builder {
                 _ => return err(f.span(), &format!("`{name}` is an array: assign a local array by element in a loop")),
             }
         }
-        let (env, params) = (self.env.clone(), self.params.clone());
+        let (env, params, ilocals) = (self.env.clone(), self.params.clone(), self.ilocals.clone());
         self.elems.clear();
         self.push(Op::Loop(var.clone(), lo, hi), NONE, NONE, NONE, NONE);
         let phis: Vec<usize> = inits.iter().map(|&init| self.push(Op::Phi, init, NONE, NONE, NONE)).collect();
@@ -291,7 +428,7 @@ impl Builder {
         }
         self.elems.clear();
         self.push(Op::End, NONE, NONE, NONE, NONE);
-        (self.env, self.params) = (env, params);
+        (self.env, self.params, self.ilocals) = (env, params, ilocals);
         for (name, &p) in carried.iter().zip(&phis) {
             let out = self.push(Op::Out, p, NONE, NONE, NONE);
             self.env.insert(name.clone(), Val::Node(out));
@@ -300,28 +437,89 @@ impl Builder {
         Ok(quote!(#(#attrs)* for #pat in #range { #body }))
     }
 
-    /// An integer expression: literals, loop variables and `+ - * / %`.
+    /// An integer expression: literals, loop variables, integer locals and `+ - * / %` of
+    /// them; anything else is plain Rust.
     fn int(&self, e: &Expr) -> Result<Int> {
+        let name = match e {
+            Expr::Path(p) => p.path.get_ident().map(|id| id.to_string()),
+            _ => None,
+        };
         match e {
             Expr::Lit(syn::ExprLit { lit: Lit::Int(k), .. }) => Ok(Int::Lit(k.base10_parse()?)),
-            Expr::Path(p) if p.path.get_ident().is_some_and(|id| self.ints.contains(&id.to_string())) => {
-                Ok(Int::Var(p.path.get_ident().unwrap().to_string()))
+            _ if name.as_ref().is_some_and(|n| self.ints.contains(n)) => Ok(Int::Var(name.unwrap())),
+            _ if name.as_ref().is_some_and(|n| self.ilocals.contains_key(n)) => Ok(self.ilocals[&name.unwrap()].clone()),
+            _ if name.as_ref().is_some_and(|n| self.env.get(n).is_some_and(|v| self.f64_local(v))) => {
+                let n = name.unwrap();
+                err(e.span(), &format!("`{n}` is an `f64`: an integer local is declared with its type, `let {n}: usize = ..;`"))
             }
             Expr::Paren(p) => self.int(&p.expr),
             Expr::Group(g) => self.int(&g.expr),
-            Expr::Binary(b) => {
+            Expr::Binary(b) if matches!(b.op, BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_) | BinOp::Rem(_)) => {
                 let op = match b.op {
                     BinOp::Add(_) => '+',
                     BinOp::Sub(_) => '-',
                     BinOp::Mul(_) => '*',
                     BinOp::Div(_) => '/',
-                    BinOp::Rem(_) => '%',
-                    _ => return err(b.op.span(), "integer expressions in a kernel use `+ - * / %`"),
+                    _ => '%',
                 };
                 Ok(Int::Bin(Box::new(self.int(&b.left)?), op, Box::new(self.int(&b.right)?)))
             }
-            _ => err(e.span(), "loop bounds and indices in a kernel are integer literals, loop variables and `+ - * / %` of them"),
+            _ => {
+                let (t, vars) = self.plain(e)?;
+                Ok(Int::Opaque(Opaque { src: t.to_string(), vars, eval: None }))
+            }
         }
+    }
+
+    /// A plain Rust expression (`MATURITIES[i]`, `weight(h)`), which the macro does not
+    /// interpret: its source for the generated code, with integer and plain `f64` locals
+    /// replaced by their variables, and the variables it reads.
+    fn plain(&self, e: &impl ToTokens) -> Result<(TokenStream, Vec<String>)> {
+        let mut vars = Vec::new();
+        let t = self.plain_tokens(e.to_token_stream(), &mut vars)?;
+        Ok((t, vars))
+    }
+
+    fn plain_tokens(&self, ts: TokenStream, vars: &mut Vec<String>) -> Result<TokenStream> {
+        let trees: Vec<TokenTree> = ts.into_iter().collect();
+        let mut out = TokenStream::new();
+        for (k, tt) in trees.iter().enumerate() {
+            match tt {
+                TokenTree::Group(g) => {
+                    let mut inner = proc_macro2::Group::new(g.delimiter(), self.plain_tokens(g.stream(), vars)?);
+                    inner.set_span(g.span());
+                    out.extend([TokenTree::Group(inner)]);
+                    continue;
+                }
+                TokenTree::Ident(id) if !in_path(&trees, k) => {
+                    let name = id.to_string();
+                    if self.ints.contains(&name) {
+                        add_vars(vars, std::slice::from_ref(&name));
+                    } else if let Some(i) = self.ilocals.get(&name) {
+                        add_vars(vars, &i.vars());
+                        let t: TokenStream = i.to_string().parse().unwrap();
+                        out.extend(quote!((#t)));
+                        continue;
+                    } else if let Some(v) = self.env.get(&name) {
+                        let Val::F(f) = v else {
+                            return err(
+                                id.span(),
+                                &format!(
+                                    "`{name}` is a kernel value: plain Rust expressions read loop variables, integers and `f64` constants"
+                                ),
+                            );
+                        };
+                        add_vars(vars, f.vars());
+                        let t = f.tokens();
+                        out.extend(quote!((#t)));
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.extend([tt.clone()]);
+        }
+        Ok(out)
     }
 
     /// A constant index is within the local array `m`.
@@ -333,16 +531,29 @@ impl Builder {
         }
     }
 
-    fn bind(&mut self, pat: &Pat, v: Val) -> Result<()> {
+    /// `ty`: the type the user wrote for `pat`.
+    fn bind(&mut self, pat: &Pat, v: Val, ty: Option<&syn::Type>) -> Result<()> {
         match (pat, v) {
             (Pat::Ident(p), _) if self.carried.contains(&p.ident.to_string()) => {
                 err(p.span(), &format!("`{}` is carried to the next iteration: a `let` here would hide it, use another name", p.ident))
             }
-            (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span()),
-            (Pat::Type(t), v) => self.bind(&t.pat, v),
+            (Pat::Ident(p), v) => self.set(p.ident.to_string(), v, p.span(), ty),
+            (Pat::Type(t), v) => self.bind(&t.pat, v, Some(&t.ty)),
             (Pat::Wild(_), _) => Ok(()),
-            (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => t.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v)),
-            (Pat::Slice(s), Val::Arr(vs)) if s.elems.len() == vs.len() => s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v)),
+            (Pat::Tuple(t), Val::Arr(vs)) if t.elems.len() == vs.len() => {
+                let tys: Vec<_> = match ty {
+                    Some(syn::Type::Tuple(tt)) if tt.elems.len() == vs.len() => tt.elems.iter().map(Some).collect(),
+                    _ => vec![None; vs.len()],
+                };
+                t.elems.iter().zip(vs).zip(tys).try_for_each(|((p, v), ty)| self.bind(p, v, ty))
+            }
+            (Pat::Slice(s), Val::Arr(vs)) if s.elems.len() == vs.len() => {
+                let ty = match ty {
+                    Some(syn::Type::Array(a)) => Some(&*a.elem),
+                    _ => None,
+                };
+                s.elems.iter().zip(vs).try_for_each(|(p, v)| self.bind(p, v, ty))
+            }
             (p, _) => err(p.span(), "unsupported pattern (use a name, `_`, or a tuple/array of them)"),
         }
     }
@@ -377,6 +588,9 @@ impl Builder {
                     if self.ints.contains(&name) {
                         return err(sp, &format!("`{name}` is a loop variable (`usize`): write `{name} as f64` for its value"));
                     }
+                    if self.ilocals.contains_key(&name) {
+                        return err(sp, &format!("`{name}` is a `usize`: write `{name} as f64` for its value"));
+                    }
                     if let Some(v) = self.env.get(&name) {
                         return Ok((v.clone(), e.to_token_stream()));
                     }
@@ -384,7 +598,7 @@ impl Builder {
                         return err(sp, &format!("unknown variable `{name}` (constants are SCREAMING_CASE or paths)"));
                     }
                 }
-                Ok((Val::F(F::Expr(e.to_token_stream())), e.to_token_stream()))
+                Ok((Val::F(F::Expr(e.to_token_stream(), vec![])), e.to_token_stream()))
             }
             Expr::Index(ix) => {
                 let idx = self.int(&ix.index)?;
@@ -402,10 +616,7 @@ impl Builder {
                 let v = match (v, idx.constant()) {
                     (Val::Arr(vs), Some(k)) => vs.get(k).cloned().ok_or_else(|| Error::new(ix.index.span(), "index out of bounds"))?,
                     (Val::Arr(_), None) => {
-                        return err(
-                            ix.index.span(),
-                            "an index that depends on a loop variable needs an array parameter or a local array (`let mut a = [x; LEN];`)",
-                        );
+                        return err(ix.index.span(), "a computed index needs an array parameter or a local array (`let mut a = [x; 8];`)");
                     }
                     (Val::Mem(m), _) => {
                         self.check_index(&idx, m, ix.index.span())?;
@@ -419,12 +630,17 @@ impl Builder {
                             }
                         }
                     }
+                    (Val::F(_), _) => {
+                        // a plain Rust array (`SWAPRATES[i]`)
+                        let (t, vars) = self.plain(e)?;
+                        return Ok((Val::F(F::Expr(t, vars)), e.to_token_stream()));
+                    }
                     _ => return err(sp, "indexing a value that is not an array"),
                 };
                 Ok((v, quote!(#t[#i])))
             }
             Expr::Repeat(r) => {
-                let Some(len) = self.int(&r.len)?.constant() else { return err(r.len.span(), "array lengths are constant") };
+                let Some(len) = self.int(&r.len)?.constant() else { return err(r.len.span(), "local array lengths are integer literals") };
                 let (v, t) = self.expr(&r.expr)?;
                 let fill = self.node(&v, r.expr.span())?;
                 let m = self.push(Op::Array(len), fill, NONE, NONE, NONE);
@@ -432,14 +648,19 @@ impl Builder {
                 Ok((Val::Mem(m), quote!([#t; #l])))
             }
             Expr::Cast(c) if matches!(&*c.ty, syn::Type::Path(p) if p.path.is_ident("f64")) => {
-                // a loop index is a (passive) node, so plain f64 arithmetic never sees it
-                let idx = self.int(&c.expr)?;
+                let idx = match self.int(&c.expr) {
+                    Ok(idx) => idx,
+                    // `w as f64` of a plain `f64` (`w = weight(i)`) is `w`
+                    Err(e) => match self.expr(&c.expr) {
+                        Ok((Val::F(f), _)) => return Ok((Val::F(f), c.to_token_stream())),
+                        _ => return Err(e),
+                    },
+                };
                 if let Some(k) = idx.constant() {
                     return Ok((Val::F(F::Num(k as f64)), e.to_token_stream()));
                 }
-                let v = self.push(Op::Int(idx), NONE, NONE, NONE, NONE);
-                let n = &self.n;
-                Ok((Val::Node(v), quote!(<#n as ::core::convert::From<f64>>::from(#e))))
+                let t: TokenStream = format!("{idx} as f64").parse().unwrap();
+                Ok((Val::F(F::Expr(t, idx.vars())), e.to_token_stream()))
             }
             Expr::Array(a) => {
                 let mut vs = Vec::new();
@@ -467,7 +688,7 @@ impl Builder {
                     Val::F(F::Num(k)) => Val::F(F::Num(-k)),
                     Val::F(f) => {
                         let t = f.tokens();
-                        Val::F(F::Expr(quote!(-#t)))
+                        Val::F(F::Expr(quote!(-#t), f.vars().to_vec()))
                     }
                     v => {
                         let a = self.node(&v, sp)?;
@@ -506,7 +727,9 @@ impl Builder {
                     }),
                     _ => {
                         let (x, y) = (a.tokens(), c.tokens());
-                        F::Expr(quote!(#x #sym #y))
+                        let mut vars = a.vars().to_vec();
+                        add_vars(&mut vars, c.vars());
+                        F::Expr(quote!(#x #sym #y), vars)
                     }
                 };
                 Ok((Val::F(v), quote!(#lt #sym #rt)))
@@ -523,7 +746,7 @@ impl Builder {
                 let v = if op == Op::Div {
                     let inv = match &k {
                         F::Num(y) => F::Num(1.0 / y),
-                        F::Expr(t) => F::Expr(quote!(1.0_f64 / (#t))),
+                        F::Expr(t, v) => F::Expr(quote!(1.0_f64 / (#t)), v.clone()),
                     };
                     let c = self.konst(&inv);
                     self.binary(Op::Mul, x, c)
@@ -567,8 +790,15 @@ impl Builder {
                 _ => unreachable!(),
             });
             let sa = ats.iter().zip(&m.args).map(|(t, a)| if is_literal(a) { a.to_token_stream() } else { t.clone() });
-            let src = quote!(#rt.#meth(#(#sa),*));
-            return Ok((Val::F(F::Expr(quote!(#ft.#meth(#(#fa),*)))), src));
+            let tf = &m.turbofish;
+            let src = quote!(#rt.#meth #tf (#(#sa),*));
+            let mut vars = f.vars().to_vec();
+            for a in &args {
+                if let Val::F(x) = a {
+                    add_vars(&mut vars, x.vars());
+                }
+            }
+            return Ok((Val::F(F::Expr(quote!(#ft.#meth #tf (#(#fa),*)), vars)), src));
         }
         let mut src = quote!(#rt.#meth(#(#ats),*));
         let x = self.node(&recv, m.receiver.span())?;
@@ -594,6 +824,9 @@ impl Builder {
             "powf" => {
                 arity(1)?;
                 let k = fk(0)?;
+                if self.varies(k.vars()) {
+                    return err(m.args[0].span(), "the exponent of `powf` cannot depend on a loop variable");
+                }
                 self.unary(Op::Powk(k.source()), x)
             }
             "radd" | "rsub" | "rmul" | "rdiv" => {
@@ -626,7 +859,7 @@ impl Builder {
                 let nax = self.push(Op::Neg, ax, NONE, NONE, NONE);
                 let inv = match &eps {
                     F::Num(y) => F::Num(1.0 / y),
-                    F::Expr(t) => F::Expr(quote!(1.0_f64 / (#t))),
+                    F::Expr(t, v) => F::Expr(quote!(1.0_f64 / (#t)), v.clone()),
                 };
                 let ci = self.konst(&inv);
                 let q = self.push(Op::Mul, nax, ci, NONE, NONE);
@@ -653,6 +886,12 @@ impl Builder {
         let Expr::Path(p) = &*c.func else { return err(sp, "unsupported call in a kernel") };
         let last = p.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
         let f = &c.func;
+        let f64_from = p.path.segments.len() == 2 && p.path.segments[0].ident == "f64";
+        if last != "select_gt" && (last != "from" || f64_from) {
+            // a plain Rust function (`weight(h)`, `f64::from(n)`)
+            let (t, vars) = self.plain(c)?;
+            return Ok((Val::F(F::Expr(t, vars)), c.to_token_stream()));
+        }
         if last == "select_gt" && c.args.len() == 4 {
             // a plain f64 argument becomes its constant node right after it is evaluated, as
             // `N::from(k)` does in the rewritten source
@@ -681,7 +920,7 @@ impl Builder {
                 }
                 _ => err(sp, "`N::from` takes a plain f64"),
             },
-            _ => err(sp, "unsupported call in a kernel (`N::select_gt(a, b, x, y)`, `N::from(k)`)"),
+            _ => err(sp, "`from` takes one argument, `select_gt` four"),
         }
     }
 
@@ -703,6 +942,8 @@ impl Builder {
     /// for comparison with the tracer.
     pub fn graph_code(&self) -> TokenStream {
         let krate = &self.krate;
+        // constants read the lets of constants by name
+        let lets = self.const_defs(None);
         let nodes = self.g.nodes.iter().enumerate().map(|(i, n)| {
             let arg = |x: usize| if x == NONE { quote!(#krate::__private::codegen::NONE) } else { quote!(#x) };
             let (a, b, c, d) = (arg(n.a), arg(n.b), arg(n.c), arg(n.d));
@@ -734,7 +975,7 @@ impl Builder {
                 Op::SelGt => quote!(SelGt),
                 Op::Stop => quote!(Stop),
                 Op::Loop(var, lo, hi) => {
-                    let (lo, hi) = (int_code(lo, krate), int_code(hi, krate));
+                    let (lo, hi) = (self.int_code(lo), self.int_code(hi));
                     quote!(Loop(#var.to_string(), #lo, #hi))
                 }
                 Op::End => quote!(End),
@@ -743,32 +984,132 @@ impl Builder {
                 Op::Out => quote!(Out),
                 Op::Array(len) => quote!(Array(#len)),
                 Op::Load(idx) => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Load(#idx))
                 }
                 Op::Store(idx) => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Store(#idx))
                 }
                 Op::Param { first, len, data, idx } => {
-                    let idx = int_code(idx, krate);
+                    let idx = self.int_code(idx);
                     quote!(Param { first: #first, len: #len, data: #data, idx: #idx })
                 }
-                Op::Int(idx) => {
-                    let idx = int_code(idx, krate);
-                    quote!(Int(#idx))
+                Op::Num(x) => {
+                    let x = self.opaque_code(x, quote!(f64));
+                    quote!(Num(#x))
+                }
+                Op::LetInt(idx) => {
+                    let idx = self.int_code(idx);
+                    quote!(LetInt(#idx))
+                }
+                Op::LetNum(x) => {
+                    let x = self.opaque_code(x, quote!(f64));
+                    quote!(LetNum(#x))
+                }
+                Op::LetConst { src, ty } => {
+                    let ty = match ty {
+                        Some(t) => quote!(Some(#t.to_string())),
+                        None => quote!(None),
+                    };
+                    quote!(LetConst { src: #src.to_string(), ty: #ty })
                 }
             };
-            quote!(g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
+            quote!(__raads_g.push(#krate::__private::codegen::Op::#op, #a, #b, #c, #d);)
         });
         let outs = &self.g.outs;
         quote! {
-            let mut g = #krate::__private::codegen::Graph::default();
+            #lets
+            let mut __raads_g = #krate::__private::codegen::Graph::default();
             #(#nodes)*
-            g.outs = vec![#(#outs),*];
-            g
+            __raads_g.outs = vec![#(#outs),*];
+            __raads_g
         }
     }
+
+    /// Code that builds `i`.
+    fn int_code(&self, i: &Int) -> TokenStream {
+        let krate = &self.krate;
+        match i {
+            Int::Lit(k) => quote!(#krate::__private::codegen::Int::Lit(#k)),
+            Int::Var(v) => quote!(#krate::__private::codegen::Int::Var(#v.to_string())),
+            Int::Bin(a, op, b) => {
+                let (a, b) = (self.int_code(a), self.int_code(b));
+                quote!(#krate::__private::codegen::Int::Bin(Box::new(#a), #op, Box::new(#b)))
+            }
+            Int::Opaque(x) => {
+                let x = self.opaque_code(x, quote!(usize));
+                quote!(#krate::__private::codegen::Int::Opaque(#x))
+            }
+        }
+    }
+
+    /// `let`s of the locals of constants ([`Op::LetConst`], constant [`Op::LetInt`]s), in order:
+    /// all of them, or those the Rust source `src` reads.
+    fn const_defs(&self, src: Option<&str>) -> TokenStream {
+        let defs: Vec<_> = (self.g.nodes.iter().enumerate())
+            .filter_map(|(i, n)| match &n.op {
+                Op::LetInt(k) if self.const_lets.contains(&format!("p{i}")) => Some((i, Some("usize".to_string()), k.to_string())),
+                Op::LetConst { src, ty } => Some((i, ty.clone(), src.clone())),
+                _ => None,
+            })
+            .collect();
+        // a def reads only earlier ones
+        let mut need = src.map(idents);
+        for (i, _, s) in defs.iter().rev() {
+            if let Some(need) = need.as_mut().filter(|n| n.contains(&format!("p{i}"))) {
+                need.extend(idents(s));
+            }
+        }
+        let defs = defs.iter().filter(|(i, ..)| need.as_ref().is_none_or(|n| n.contains(&format!("p{i}")))).map(|(i, ty, s)| {
+            let id = format_ident!("p{i}");
+            let ty: TokenStream = ty.as_ref().map(|t| format!(": {t}")).unwrap_or_default().parse().unwrap();
+            let t: TokenStream = s.parse().unwrap();
+            quote!(#[allow(unused_variables)] let #id #ty = #t;)
+        });
+        quote!(#(#defs)*)
+    }
+
+    /// Code that builds `x`, with a function that evaluates it from its variables (and computes
+    /// the locals of constants it may read).
+    fn opaque_code<T>(&self, x: &Opaque<T>, ty: TokenStream) -> TokenStream {
+        let krate = &self.krate;
+        let (src, vars) = (&x.src, &x.vars);
+        let defs = self.const_defs(Some(src));
+        let t: TokenStream = src.parse().unwrap();
+        let binds = vars.iter().enumerate().map(|(k, v)| {
+            let id = Ident::new(v, Span::call_site());
+            match self.num_lets.contains(v) {
+                true => quote!(#[allow(unused_variables)] let #id: f64 = __raads_vars[#k];),
+                false => quote!(#[allow(unused_variables)] let #id: usize = __raads_vars[#k] as usize;),
+            }
+        });
+        quote! {
+            #krate::__private::codegen::Opaque {
+                src: #src.to_string(),
+                vars: vec![#(#vars.to_string()),*],
+                eval: Some(|__raads_vars: &[f64]| -> #ty { #defs #(#binds)* #t }),
+            }
+        }
+    }
+}
+
+/// The identifiers in the Rust source `src`.
+fn idents(src: &str) -> HashSet<String> {
+    fn walk(ts: TokenStream, out: &mut HashSet<String>) {
+        for tt in ts {
+            match tt {
+                TokenTree::Ident(id) => {
+                    out.insert(id.to_string());
+                }
+                TokenTree::Group(g) => walk(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(src.parse().unwrap(), &mut out);
+    out
 }
 
 /// `v` is or contains a local array.
@@ -780,15 +1121,30 @@ fn has_mem(v: &Val) -> bool {
     }
 }
 
-/// Code that builds `i`.
-fn int_code(i: &Int, krate: &TokenStream) -> TokenStream {
-    match i {
-        Int::Lit(k) => quote!(#krate::__private::codegen::Int::Lit(#k)),
-        Int::Var(v) => quote!(#krate::__private::codegen::Int::Var(#v.to_string())),
-        Int::Bin(a, op, b) => {
-            let (a, b) = (int_code(a, krate), int_code(b, krate));
-            quote!(#krate::__private::codegen::Int::Bin(Box::new(#a), #op, Box::new(#b)))
+/// Add the variables `new` to `vars`.
+fn add_vars(vars: &mut Vec<String>, new: &[String]) {
+    for v in new {
+        if !vars.contains(v) {
+            vars.push(v.clone());
         }
+    }
+}
+
+/// Token `k` is a field, method or path segment (after `.` or `::`) or a path prefix
+/// (before `::`), not a variable.
+fn in_path(trees: &[TokenTree], k: usize) -> bool {
+    let punct = |j: Option<usize>, c: char| matches!(j.and_then(|j| trees.get(j)), Some(TokenTree::Punct(p)) if p.as_char() == c);
+    punct(k.checked_sub(1), '.') || punct(k.checked_sub(1), ':') || (punct(Some(k + 1), ':') && punct(Some(k + 2), ':'))
+}
+
+/// The name in `let name: usize = ..`.
+fn usize_name(p: &Pat) -> Option<&Ident> {
+    match p {
+        Pat::Type(t) if matches!(&*t.ty, syn::Type::Path(ty) if ty.path.is_ident("usize")) => match &*t.pat {
+            Pat::Ident(id) => Some(&id.ident),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

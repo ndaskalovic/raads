@@ -34,7 +34,7 @@ struct Unroll<'a> {
 }
 
 impl Unroll<'_> {
-    fn run(&mut self, from: usize, to: usize, vars: &mut Vec<(String, usize)>) {
+    fn run(&mut self, from: usize, to: usize, vars: &mut Vec<(String, f64)>) {
         let mut i = from;
         while i < to {
             let n = &self.g.nodes[i];
@@ -46,10 +46,12 @@ impl Unroll<'_> {
                     for p in (i + 1..end).filter(|&p| self.parents[p] == i && self.g.nodes[p].op == Op::Phi) {
                         self.cur[p] = self.map[self.g.nodes[p].a];
                     }
+                    // locals of an iteration go out of scope at its end
+                    let scope = vars.len();
                     for k in lo..hi {
-                        vars.push((var.clone(), k));
+                        vars.push((var.clone(), k as f64));
                         self.run(i + 1, end, vars);
-                        vars.pop();
+                        vars.truncate(scope);
                     }
                     i = end + 1;
                     continue;
@@ -64,8 +66,12 @@ impl Unroll<'_> {
                     let k = idx.eval(vars).expect("index");
                     self.arrays[n.a][k] = self.map[n.b];
                 }
-                Op::Int(idx) => {
-                    let k = idx.eval(vars).expect("index") as f64;
+                Op::LetInt(idx) => vars.push((format!("p{i}"), idx.eval(vars).expect("integer") as f64)),
+                Op::LetNum(x) => vars.push((format!("p{i}"), x.call(vars).expect("number"))),
+                // plain Rust that reads it recomputes it
+                Op::LetConst { .. } => {}
+                Op::Num(x) => {
+                    let k = x.call(vars).expect("number");
                     self.map[i] = self.out.push(Op::Const(crate::f64_literal(k)), NONE, NONE, NONE, NONE);
                 }
                 Op::Param { first, len, data, idx } => {
